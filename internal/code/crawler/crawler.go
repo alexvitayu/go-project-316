@@ -45,22 +45,25 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	var page Page
 	resp, err := opts.HTTPClient.Get(opts.URL)
 	if err != nil {
-		page = Page{URL: opts.URL,
-			Depth:      opts.Depth,
-			HTTPStatus: 0,
-			Status:     "Failed",
-			Error:      "get request failed",
-		}
-	} else {
-		page = Page{
-			URL:        opts.URL,
-			Depth:      opts.Depth,
-			HTTPStatus: resp.StatusCode,
-			Status:     resp.Status,
-			Error:      "",
-		}
+		//page = Page{URL: opts.URL,
+		//	Depth:      opts.Depth,
+		//	HTTPStatus: 0,
+		//	Status:     "Failed",
+		//	Error:      "get request failed",
+		//}
+		return nil, fmt.Errorf("get request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+
+	page = Page{
+		URL:        opts.URL,
+		Depth:      opts.Depth,
+		HTTPStatus: resp.StatusCode,
+		Status:     resp.Status,
+		Error:      "",
+	}
 
 	pages = append(pages, page)
 
