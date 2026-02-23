@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Тестовая страница для парсера ссылок</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .section { margin: 30px 0; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
+        .broken { background-color: #ffeeee; }
+        h2 { color: #333; }
+    </style>
+</head>
+<body>
+<h1>Тестирование парсера ссылок</h1>
+<p>Всего на странице <strong>15 ссылок</strong> для проверки</p>
+
+<!-- Раздел с рабочими ссылками -->
+<div class="section">
+    <h2>Рабочие ссылки</h2>
+    <ul>
+        <li><a href="https://www.google.com">Google (рабочая)</a></li>
+        <li><a href="https://github.com">GitHub (рабочая)</a></li>
+        <li><a href="https://stackoverflow.com">Stack Overflow (рабочая)</a></li>
+        <li><a href="/relative/path">Относительная ссылка</a></li>
+        <li><a href="#section1">Якорь на этой странице</a></li>
+        <li><a href="https://www.wikipedia.org">Wikipedia</a></li>
+    </ul>
+</div>
+
+<!-- Раздел с битыми/проблемными ссылками -->
+<div class="section broken">
+    <h2>Битые и проблемные ссылки</h2>
+    <ul>
+        <li><a href="https://www.google.com/non-existent-page">Существующий домен, но несуществующая страница (404)</a></li>
+        <li><a href="https://wooordhunt.ru/word/хтрй">Существующий домен, но несуществующая страница (404)</a></li>
+
+    </ul>
+</div>
+</body>
+</html>

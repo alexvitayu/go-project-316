@@ -7,6 +7,7 @@ require (
 	github.com/lmittmann/tint v1.1.3
 	github.com/stretchr/testify v1.11.1
 	github.com/urfave/cli/v3 v3.6.2
+	golang.org/x/net v0.50.0
 )
 
 require (

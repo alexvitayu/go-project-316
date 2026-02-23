@@ -4,6 +4,7 @@ import (
 	"code/internal/code/crawler"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestAnalyze(t *testing.T) {
+	t.Parallel()
 	var testCases = []struct {
 		name         string
 		handler      http.HandlerFunc
@@ -185,4 +187,30 @@ func TestAnalyze(t *testing.T) {
 			assert.Equal(t, tc.wantResponse.Pages[0].Error, response.Pages[0].Error)
 		})
 	}
+}
+
+func TestBrokenLinks(t *testing.T) {
+	t.Parallel()
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/links_test.html")
+	}))
+	defer testServer.Close()
+
+	opts := crawler.Options{
+		URL:        testServer.URL,
+		HTTPClient: &http.Client{},
+		UserAgent:  "curl/8.14.1",
+	}
+
+	got, err := crawler.Analyze(t.Context(), opts)
+	require.NoError(t, err)
+
+	var result crawler.Response
+	json.Unmarshal(got, &result)
+
+	assert.Len(t, result.Pages[0].BrokenLinks, 2)
+
+	fmt.Println(string(got))
+
 }
