@@ -4,7 +4,6 @@ import (
 	"code/internal/code/crawler"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"syscall"
@@ -189,28 +188,65 @@ func TestAnalyze(t *testing.T) {
 	}
 }
 
-func TestBrokenLinks(t *testing.T) {
+func TestFindBrokenLinks(t *testing.T) {
 	t.Parallel()
-
-	testServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/links_test.html")
-	}))
-	defer testServer.Close()
+	testLinks := []string{"https://www.google.com", "https://github.com",
+		"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/хтрй"}
 
 	opts := crawler.Options{
-		URL:        testServer.URL,
 		HTTPClient: &http.Client{},
 		UserAgent:  "curl/8.14.1",
 	}
-
-	got, err := crawler.Analyze(t.Context(), opts)
+	got, err := crawler.FindBrokenLinks(testLinks, opts)
 	require.NoError(t, err)
+	assert.Len(t, got, 2)
+}
 
-	var result crawler.Response
-	json.Unmarshal(got, &result)
-
-	assert.Len(t, result.Pages[0].BrokenLinks, 2)
-
-	fmt.Println(string(got))
-
+func TestCollectSEO(t *testing.T) {
+	t.Parallel()
+	var testCases = []struct {
+		name    string
+		handler http.Handler
+		wantSEO *crawler.Seo
+	}{
+		{
+			name: "seo_positive_test",
+			handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/seo_test/positive_test.html")
+			}),
+			wantSEO: &crawler.Seo{
+				HasTitle:       true,
+				Title:          "My first site",
+				HasDescription: true,
+				Description:    "Programing & learning",
+				HasH1:          true,
+			},
+		},
+		{
+			name: "seo_negative_test",
+			handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/seo_test/negative_test.html")
+			}),
+			wantSEO: &crawler.Seo{
+				HasTitle:       false,
+				Title:          "",
+				HasDescription: false,
+				Description:    "",
+				HasH1:          false,
+			},
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(tc.handler)
+			client := http.Client{}
+			resp, err := client.Get(server.URL)
+			require.NoError(t, err)
+			seo, err := crawler.CollectSEO(resp.Body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSEO, seo)
+		})
+	}
 }

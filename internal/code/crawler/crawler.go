@@ -1,19 +1,25 @@
 package crawler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
+
+var supportedSchemes = map[string]bool{
+	"http":  true,
+	"https": true,
+}
 
 type Options struct {
 	URL         string
@@ -32,8 +38,9 @@ type Page struct {
 	Depth        int           `json:"depth"`
 	HTTPStatus   int           `json:"http_status"`
 	Status       string        `json:"status"`
-	BrokenLinks  []BrokenLinks `json:"broken_links"`
 	Error        string        `json:"error"`
+	Seo          *Seo          `json:"seo"`
+	BrokenLinks  []BrokenLinks `json:"broken_links"`
 	DiscoveredAt time.Time     `json:"discovered_at,omitempty"`
 }
 
@@ -41,6 +48,14 @@ type BrokenLinks struct {
 	URL        string `json:"url"`
 	StatusCode int    `json:"status_code,omitempty"`
 	Err        string `json:"error,omitempty"`
+}
+
+type Seo struct {
+	HasTitle       bool   `json:"has_title"`
+	Title          string `json:"title"`
+	HasDescription bool   `json:"has_description"`
+	Description    string `json:"description"`
+	HasH1          bool   `json:"has_h1"`
 }
 
 type Response struct {
@@ -55,10 +70,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	_ = ctx //TODO
 	var pages []Page
 
-	fmt.Println("печатаю текст...")               //TODO
-	fmt.Printf("User-Agent = %s", opts.UserAgent) //TODO
-
-	// Делаем запрос на базовый URL
+	// Делаем запрос на базовый URL get запросом для извлечения тела - html
 	// Создаем новый запрос
 	req, err := http.NewRequest("GET", opts.URL, nil)
 	if err != nil {
@@ -72,42 +84,37 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	resp, err := opts.HTTPClient.Do(req)
 	if err != nil {
 		if resp != nil {
-			defer resp.Body.Close() // Даже при ошибке resp может быть не nil!
+			resp.Body.Close() // Даже при ошибке resp может быть не nil!
 		}
 		return nil, fmt.Errorf("get request failed: %w", err)
 	}
-	defer resp.Body.Close()
+
+	// Сохраним body для дальнейшей работы в разных местах
+	savedBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to save body: %w", err)
+	}
 
 	// Извлекаем ссылки из стартовой страницы
-	links := checkHTML(resp.Body)
-
-	for i, v := range links {
-		n := i + 1
-		fmt.Printf("link %d = %s\n", n, v)
-	}
+	links := checkHTML(bytes.NewReader(savedBody))
 
 	// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-	repeated := make(map[string]struct{}) //отслеживаем одинаковые ссылки на странице
-	URLs := make([]string, 0, len(links))
-	for _, l := range links {
-		_, ok := repeated[l]
-		if ok {
-			continue // если повторяется, то идем обрабатывать следующую ссылку
-		}
-		abs := resolveUrl(opts.URL, l)
-		URLs = append(URLs, abs)
-		repeated[l] = struct{}{}
-	}
-
-	for i, v := range URLs {
-		n := i + 1
-		fmt.Printf("link %d = %s\n", n, v)
+	URLs, err := ProcessLinks(links, &opts)
+	if err != nil {
+		return nil, fmt.Errorf("ProcessLinks: %w", err)
 	}
 
 	// Сделаем запросы к найденным URL и сформируем слайс битых ссылок
-	brLinks, err := findBrokenLinks(URLs, opts)
+	brLinks, err := FindBrokenLinks(URLs, opts)
 	if err != nil {
-		return nil, fmt.Errorf("findBrokenLinks: %w", err)
+		return nil, fmt.Errorf("FindBrokenLinks: %w", err)
+	}
+
+	// Соберём SEO из полученной html страницы
+	seo, err := CollectSEO(bytes.NewReader(savedBody))
+	if err != nil {
+		return nil, fmt.Errorf("CollectSEO: %w", err)
 	}
 
 	page := Page{
@@ -115,8 +122,9 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		Depth:        opts.Depth,
 		HTTPStatus:   resp.StatusCode,
 		Status:       resp.Status,
-		BrokenLinks:  brLinks,
 		Error:        "",
+		Seo:          seo,
+		BrokenLinks:  brLinks,
 		DiscoveredAt: time.Now(),
 	}
 
@@ -154,106 +162,150 @@ func checkHTML(r io.Reader) []string {
 	return links
 }
 
-func resolveUrl(baseURL, rawURL string) string {
+func resolveUrl(baseURL, rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
-	_ = err //TODO
-
-	if u != nil {
-		if u.IsAbs() {
-			return u.String()
-		}
+	if err != nil {
+		return "", fmt.Errorf("resolveUrl: %w", err)
 	}
 
-	base, _ := url.Parse(baseURL)
-	_ = err //TODO
+	if u.IsAbs() {
+		return u.String(), nil
+	}
+
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("resolveUrl: %w", err)
+	}
 
 	abs := base.ResolveReference(u)
-	return abs.String()
+	return abs.String(), nil
 }
 
-//func resolveUrl(baseURL, rawURL string) string {
-//	// Пропускаем пустые ссылки
-//	if strings.TrimSpace(rawURL) == "" {
-//		return ""
-//	}
-//
-//	// Специальные протоколы, которые не нужно резолвить
-//	if strings.HasPrefix(rawURL, "mailto:") ||
-//		strings.HasPrefix(rawURL, "tel:") ||
-//		strings.HasPrefix(rawURL, "javascript:") {
-//		return rawURL
-//	}
-//
-//	// Якоря (если хотите обрабатывать отдельно)
-//	if strings.HasPrefix(rawURL, "#") {
-//		return baseURL + rawURL // или просто rawURL, в зависимости от задачи
-//	}
-//
-//	// Парсим rawURL
-//	u, err := url.Parse(rawURL)
-//	if err != nil || u == nil {
-//		// Если не удалось распарсить, возвращаем исходную строку
-//		return rawURL
-//	}
-//
-//	// Если это абсолютный URL, возвращаем как есть
-//	if u.IsAbs() {
-//		return u.String()
-//	}
-//
-//	// Парсим базовый URL
-//	base, err := url.Parse(baseURL)
-//	if err != nil || base == nil {
-//		// Если базовый URL некорректный, возвращаем rawURL
-//		return rawURL
-//	}
-//
-//	// Разрешаем относительный URL
-//	resolved := base.ResolveReference(u)
-//	if resolved == nil {
-//		return rawURL
-//	}
-//
-//	return resolved.String()
-//}
+func isValidURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
 
-func findBrokenLinks(URLs []string, opts Options) ([]BrokenLinks, error) {
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+
+	return supportedSchemes[parsed.Scheme]
+}
+
+func FindBrokenLinks(URLs []string, opts Options) ([]BrokenLinks, error) {
 	var brLinks []BrokenLinks
 	var brLink BrokenLinks
+
 	for _, u := range URLs {
-
-		req, err := http.NewRequest("GET", u, nil)
+		resp, err := makeHEADorGETRequest(u, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to make request: %w", err)
-		}
-
-		// Устанавливаем User-Agent (имитируем реальный браузер)
-		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-		// Выполняем запрос
-		resp, err := opts.HTTPClient.Do(req)
-		if err != nil {
-			if resp != nil {
-				defer resp.Body.Close() // Даже при ошибке resp может быть не nil!
-			}
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
 			brLink = BrokenLinks{
 				URL: u,
-				Err: fmt.Sprint(err),
+				Err: err.Error(),
 			}
 			brLinks = append(brLinks, brLink)
-			return nil, fmt.Errorf("get request failed: %w", err)
+			continue
 		}
-		defer resp.Body.Close()
 
-		if strings.HasPrefix(strconv.Itoa(resp.StatusCode), "4") ||
-			strings.HasPrefix(strconv.Itoa(resp.StatusCode), "5") {
+		if resp.StatusCode >= 400 {
 			brLink = BrokenLinks{
 				URL:        u,
 				StatusCode: resp.StatusCode,
 			}
 			brLinks = append(brLinks, brLink)
 		}
+		resp.Body.Close()
 	}
 	return brLinks, nil
+}
+
+func makeHEADorGETRequest(url string, opts Options) (*http.Response, error) {
+	headReq, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return makeGetRequest(url, opts)
+	}
+
+	// Устанавливаем User-Agent (имитируем реальный браузер)
+	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+
+	headResp, err := opts.HTTPClient.Do(headReq)
+	if err != nil {
+		return makeGetRequest(url, opts)
+	}
+
+	// При успешном HEAD запросе возвращаем response
+	if headResp.StatusCode >= 200 && headResp.StatusCode < 300 {
+		return headResp, nil
+	}
+	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
+	headResp.Body.Close()
+	return makeGetRequest(url, opts)
+}
+
+func makeGetRequest(url string, opts Options) (*http.Response, error) {
+	getReq, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fail to create get request: %w", err)
+	}
+
+	getReq.Header.Set("User-Agent", opts.UserAgent)
+
+	getResp, err := opts.HTTPClient.Do(getReq)
+	if err != nil {
+		return nil, fmt.Errorf("fail to make get request: %w", err)
+	}
+	return getResp, nil
+}
+
+func CollectSEO(body io.Reader) (*Seo, error) {
+	var seo Seo
+
+	doc, err := goquery.NewDocumentFromReader(body)
+	if err != nil {
+		return &Seo{}, fmt.Errorf("goquery: %w", err)
+	}
+
+	title := doc.Find("title").Text()
+	thereIsTitle := doc.Find("title").Length() > 0
+	if thereIsTitle {
+		seo.HasTitle = true
+		seo.Title = html.UnescapeString(title)
+	}
+
+	dscr, exists := doc.Find("meta[name='description']").Attr("content")
+	if exists {
+		seo.HasDescription = true
+		seo.Description = html.UnescapeString(dscr)
+	}
+
+	if exists := doc.Find("h1").Length() > 0; exists {
+		seo.HasH1 = true
+	}
+	return &seo, nil
+}
+
+func ProcessLinks(links []string, opts *Options) ([]string, error) {
+	repeated := make(map[string]struct{}) //отслеживаем одинаковые ссылки на странице
+	URLs := make([]string, 0, len(links))
+	for _, l := range links {
+		_, ok := repeated[l]
+		if ok {
+			continue // если повторяется, то идем обрабатывать следующую ссылку
+		}
+		abs, err := resolveUrl(opts.URL, l) // преобразуем URLs в абсолютные
+		if err != nil {
+			slog.Warn("failed to resolve URL %s: %v\n", l, err)
+			continue
+		}
+		if abs == "" || !isValidURL(abs) {
+			continue
+		}
+
+		URLs = append(URLs, abs)
+		repeated[l] = struct{}{}
+	}
+	return URLs, nil
 }
