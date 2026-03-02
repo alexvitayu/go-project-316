@@ -47,6 +47,7 @@ func TestAnalyze(t *testing.T) {
 				return crawler.Options{
 					URL:        server.URL,
 					HTTPClient: &http.Client{},
+					Timeout:    15 * time.Second,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -84,6 +85,7 @@ func TestAnalyze(t *testing.T) {
 				return crawler.Options{
 					URL:        server.URL,
 					HTTPClient: &http.Client{},
+					Timeout:    15 * time.Second,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -120,6 +122,7 @@ func TestAnalyze(t *testing.T) {
 				return crawler.Options{
 					URL:        server.URL,
 					HTTPClient: &http.Client{},
+					Timeout:    15 * time.Second,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -145,6 +148,7 @@ func TestAnalyze(t *testing.T) {
 					HTTPClient: &http.Client{
 						Timeout: 2 * time.Millisecond,
 					},
+					Timeout: 15 * time.Second,
 				}
 			},
 			wantErr:    context.DeadlineExceeded,
@@ -156,6 +160,7 @@ func TestAnalyze(t *testing.T) {
 				return crawler.Options{
 					URL:        "http://localhost:65535",
 					HTTPClient: &http.Client{},
+					Timeout:    15 * time.Second,
 				}
 			},
 			wantErr:    syscall.ECONNREFUSED,
@@ -205,34 +210,10 @@ func TestArrangeLinks(t *testing.T) {
 
 		wantLengthBroken := 2
 
-		broken, err := crawler.ArrangeLinks(sourceLinks, opts, item, &queue)
+		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, &queue)
 		require.NoError(t, err)
 		assert.Len(t, broken, wantLengthBroken)
 	})
-
-	//t.Run("find_alive_inner_links", func(t *testing.T) {
-	//	t.Parallel()
-	//	opts := crawler.Options{
-	//		URL:        "https://wooordhunt.ru/", // HOST baseURL
-	//		HTTPClient: &http.Client{},
-	//		UserAgent:  "curl/8.14.1",
-	//	}
-	//	sourceLinks := []string{"https://wooordhunt.ru/word/query", "https://github.com",
-	//		"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/snap",
-	//		"https://translate.yandex.com/en/translator/English-Russian", "https://wooordhunt.ru/history/top"}
-	//
-	//	wantLengthAlive := 3
-	//	wantLinks := []string{"https://wooordhunt.ru/word/query", "https://wooordhunt.ru/word/snap",
-	//		"https://wooordhunt.ru/history/top"}
-	//
-	//	_, err := crawler.ArrangeLinks(sourceLinks, opts)
-	//	require.NoError(t, err)
-	//	assert.Len(t, alive, wantLengthAlive)
-	//	assert.Equal(t, wantLinks[0], alive[0].URL)
-	//	assert.Equal(t, wantLinks[1], alive[1].URL)
-	//	assert.Equal(t, wantLinks[2], alive[2].URL)
-	//
-	//})
 }
 
 func TestCollectSEO(t *testing.T) {

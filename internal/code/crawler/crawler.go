@@ -9,6 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -73,8 +76,18 @@ type AliveInnerLink struct {
 }
 
 // Analyze - Основная точка входа в crawler
-func Analyze(ctx context.Context, opts Options) ([]byte, error) {
-	_ = ctx //TODO
+func Analyze(c context.Context, opts Options) ([]byte, error) {
+	// Обработка флага timeout
+	ctx, cancel := context.WithTimeout(c, opts.Timeout)
+	defer cancel()
+
+	// Обработка Ctrl + C
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		cancel() // отменяем контекст при получении сигнала
+	}()
 
 	// Для орагизации извлечения ссылок и дальнейшей их обработки создадим очередь
 	queue := make([]AliveInnerLink, 0, initQueueCapacity)
@@ -89,81 +102,9 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		LinkDepth: 0,
 	})
 
-	for len(queue) > 0 {
-		item := queue[0]
-
-		fmt.Printf("FIRST ELEMENT =  %v\n", item.URL)
-
-		if item.LinkDepth <= opts.Depth {
-			queue = queue[1:]
-
-			if _, ok := isVisited[item.URL]; ok {
-				continue
-			}
-
-			// Создаем новый запрос
-			req, err := http.NewRequest("GET", item.URL, nil)
-			if err != nil {
-				return nil, fmt.Errorf("failed to make request: %w", err)
-			}
-
-			// Устанавливаем User-Agent (имитируем реальный браузер)
-			req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-			// Выполняем запрос
-			resp, err := opts.HTTPClient.Do(req)
-			if err != nil {
-				if resp != nil {
-					resp.Body.Close() // Даже при ошибке resp может быть не nil!
-				}
-				return nil, fmt.Errorf("get request failed: %w", err)
-			}
-
-			// Сохраним body для дальнейшей работы в разных местах
-			savedBody, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				return nil, fmt.Errorf("failed to save body: %w", err)
-			}
-
-			// Извлекаем ссылки из страницы
-			links := checkHTML(bytes.NewReader(savedBody))
-
-			// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-			URLs, err := ProcessLinks(links, &opts)
-			if err != nil {
-				return nil, fmt.Errorf("ProcessLinks: %w", err)
-			}
-
-			// Сделаем запросы к найденным URL и сформируем слайс битых ссылок
-			brLinks, err := ArrangeLinks(URLs, opts, item, &queue)
-			if err != nil {
-				return nil, fmt.Errorf("ArrangeLinks: %w", err)
-			}
-
-			// Соберём SEO из полученной html страницы
-			seo, err := CollectSEO(bytes.NewReader(savedBody))
-			if err != nil {
-				return nil, fmt.Errorf("CollectSEO: %w", err)
-			}
-
-			pages = append(pages, Page{
-				URL:          item.URL,
-				Depth:        item.LinkDepth,
-				HTTPStatus:   resp.StatusCode,
-				Status:       resp.Status,
-				Error:        "",
-				Seo:          seo,
-				BrokenLinks:  brLinks,
-				DiscoveredAt: time.Now(),
-			})
-
-			//for i, v := range queue {
-			//	fmt.Printf("FINISH queue %v = %v\n", i, v.URL)
-			//}
-		}
-
-		isVisited[item.URL] = struct{}{}
+	pages, err := worker(ctx, queue, pages, opts, isVisited)
+	if err != nil {
+		return nil, fmt.Errorf("worker: %w", err)
 	}
 
 	data := Response{
@@ -178,6 +119,90 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		return nil, fmt.Errorf("failed to marshal report: %w", err)
 	}
 	return report, nil
+}
+
+func worker(ctx context.Context, queue []AliveInnerLink, pages []Page, opts Options, isVisited map[string]struct{}) ([]Page, error) {
+	for len(queue) > 0 {
+		var page Page
+		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
+			page.Error = ctx.Err().Error()
+			pages = append(pages, page)
+			break
+		}
+		item := queue[0]
+
+		if item.LinkDepth <= opts.Depth {
+			queue = queue[1:]
+
+			if _, ok := isVisited[item.URL]; ok {
+				continue
+			}
+
+			// Создаем новый запрос
+			req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
+			if err != nil {
+				page.Error = err.Error()
+				return nil, fmt.Errorf("failed to make request: %w", err)
+			}
+
+			// Устанавливаем User-Agent (имитируем реальный браузер)
+			req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+
+			// Выполняем запрос
+			resp, err := opts.HTTPClient.Do(req)
+			if err != nil {
+				page.Error = err.Error()
+				if resp != nil {
+					resp.Body.Close() // Даже при ошибке resp может быть не nil!
+				}
+				return nil, fmt.Errorf("get request failed: %w", err)
+			}
+
+			// Сохраним body для дальнейшей работы в разных местах
+			savedBody, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				page.Error = err.Error()
+				return nil, fmt.Errorf("failed to save body: %w", err)
+			}
+
+			// Извлекаем ссылки из страницы
+			links := checkHTML(bytes.NewReader(savedBody))
+
+			// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
+			URLs, err := ProcessLinks(links, &opts)
+			if err != nil {
+				page.Error = err.Error()
+				return nil, fmt.Errorf("ProcessLinks: %w", err)
+			}
+
+			// Сделаем запросы к найденным URL и сформируем слайс битых ссылок
+			brLinks, err := ArrangeLinks(ctx, URLs, opts, item, &queue)
+			if err != nil {
+				page.Error = err.Error()
+				return nil, fmt.Errorf("ArrangeLinks: %w", err)
+			}
+
+			// Соберём SEO из полученной html страницы
+			seo, err := CollectSEO(bytes.NewReader(savedBody))
+			if err != nil {
+				page.Error = err.Error()
+				return nil, fmt.Errorf("CollectSEO: %w", err)
+			}
+
+			page.URL = item.URL
+			page.Depth = item.LinkDepth
+			page.HTTPStatus = resp.StatusCode
+			page.Status = resp.Status
+			page.Seo = seo
+			page.BrokenLinks = brLinks
+			page.DiscoveredAt = time.Now()
+
+			pages = append(pages, page)
+		}
+		isVisited[item.URL] = struct{}{}
+	}
+	return pages, nil
 }
 
 func checkHTML(r io.Reader) []string {
@@ -254,11 +279,11 @@ func isInnerLink(checkedURL string, item AliveInnerLink) bool {
 	return baseParsed.Host == checkedParsed.Host
 }
 
-func ArrangeLinks(extractedURLs []string, opts Options, item AliveInnerLink, queue *[]AliveInnerLink) ([]BrokenLinks, error) {
+func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queue *[]AliveInnerLink) ([]BrokenLinks, error) {
 	var brLinks []BrokenLinks
 
-	for _, u := range extractedURLs {
-		resp, err := makeHEADorGETRequest(u, opts)
+	for _, u := range URLs {
+		resp, err := makeHEADorGETRequest(ctx, u, opts)
 		if err != nil {
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
 			brLinks = append(brLinks, BrokenLinks{
@@ -277,7 +302,7 @@ func ArrangeLinks(extractedURLs []string, opts Options, item AliveInnerLink, que
 			})
 
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			if isInnerLink(u, item) && item.LinkDepth < opts.Depth {
+			if isInnerLink(u, item) && item.LinkDepth < opts.Depth { //!!! было не верное условие и не выходил из цикла
 				*queue = append(*queue, AliveInnerLink{
 					URL:       u,
 					LinkDepth: item.LinkDepth + 1,
@@ -290,10 +315,10 @@ func ArrangeLinks(extractedURLs []string, opts Options, item AliveInnerLink, que
 	return brLinks, nil
 }
 
-func makeHEADorGETRequest(url string, opts Options) (*http.Response, error) {
-	headReq, err := http.NewRequest("HEAD", url, nil)
+func makeHEADorGETRequest(ctx context.Context, url string, opts Options) (*http.Response, error) {
+	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
-		return makeGetRequest(url, opts)
+		return makeGetRequest(ctx, url, opts)
 	}
 
 	// Устанавливаем User-Agent (имитируем реальный браузер)
@@ -301,7 +326,7 @@ func makeHEADorGETRequest(url string, opts Options) (*http.Response, error) {
 
 	headResp, err := opts.HTTPClient.Do(headReq)
 	if err != nil {
-		return makeGetRequest(url, opts)
+		return makeGetRequest(ctx, url, opts)
 	}
 
 	// При успешном HEAD запросе возвращаем response
@@ -310,11 +335,11 @@ func makeHEADorGETRequest(url string, opts Options) (*http.Response, error) {
 	}
 	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
 	headResp.Body.Close()
-	return makeGetRequest(url, opts)
+	return makeGetRequest(ctx, url, opts)
 }
 
-func makeGetRequest(url string, opts Options) (*http.Response, error) {
-	getReq, err := http.NewRequest("GET", url, nil)
+func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Response, error) {
+	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fail to create get request: %w", err)
 	}
