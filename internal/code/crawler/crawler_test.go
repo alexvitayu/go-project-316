@@ -188,18 +188,51 @@ func TestAnalyze(t *testing.T) {
 	}
 }
 
-func TestFindBrokenLinks(t *testing.T) {
+func TestArrangeLinks(t *testing.T) {
 	t.Parallel()
-	testLinks := []string{"https://www.google.com", "https://github.com",
-		"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/хтрй"}
 
-	opts := crawler.Options{
-		HTTPClient: &http.Client{},
-		UserAgent:  "curl/8.14.1",
-	}
-	got, err := crawler.FindBrokenLinks(testLinks, opts)
-	require.NoError(t, err)
-	assert.Len(t, got, 2)
+	t.Run("find_broken_links", func(t *testing.T) {
+		t.Parallel()
+		opts := crawler.Options{
+			HTTPClient: &http.Client{},
+			UserAgent:  "curl/8.14.1",
+		}
+		sourceLinks := []string{"https://www.google.com", "https://github.com",
+			"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/хтрй"}
+
+		item := crawler.AliveInnerLink{}
+		queue := make([]crawler.AliveInnerLink, 0)
+
+		wantLengthBroken := 2
+
+		broken, err := crawler.ArrangeLinks(sourceLinks, opts, item, &queue)
+		require.NoError(t, err)
+		assert.Len(t, broken, wantLengthBroken)
+	})
+
+	//t.Run("find_alive_inner_links", func(t *testing.T) {
+	//	t.Parallel()
+	//	opts := crawler.Options{
+	//		URL:        "https://wooordhunt.ru/", // HOST baseURL
+	//		HTTPClient: &http.Client{},
+	//		UserAgent:  "curl/8.14.1",
+	//	}
+	//	sourceLinks := []string{"https://wooordhunt.ru/word/query", "https://github.com",
+	//		"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/snap",
+	//		"https://translate.yandex.com/en/translator/English-Russian", "https://wooordhunt.ru/history/top"}
+	//
+	//	wantLengthAlive := 3
+	//	wantLinks := []string{"https://wooordhunt.ru/word/query", "https://wooordhunt.ru/word/snap",
+	//		"https://wooordhunt.ru/history/top"}
+	//
+	//	_, err := crawler.ArrangeLinks(sourceLinks, opts)
+	//	require.NoError(t, err)
+	//	assert.Len(t, alive, wantLengthAlive)
+	//	assert.Equal(t, wantLinks[0], alive[0].URL)
+	//	assert.Equal(t, wantLinks[1], alive[1].URL)
+	//	assert.Equal(t, wantLinks[2], alive[2].URL)
+	//
+	//})
 }
 
 func TestCollectSEO(t *testing.T) {
@@ -247,6 +280,7 @@ func TestCollectSEO(t *testing.T) {
 			seo, err := crawler.CollectSEO(resp.Body)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantSEO, seo)
+			resp.Body.Close()
 		})
 	}
 }

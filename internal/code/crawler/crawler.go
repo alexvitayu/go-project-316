@@ -16,6 +16,8 @@ import (
 	"golang.org/x/net/html/atom"
 )
 
+const initQueueCapacity = 500
+
 var supportedSchemes = map[string]bool{
 	"http":  true,
 	"https": true,
@@ -65,70 +67,104 @@ type Response struct {
 	Pages       []Page    `json:"pages"`
 }
 
+type AliveInnerLink struct {
+	URL       string
+	LinkDepth int
+}
+
 // Analyze - Основная точка входа в crawler
 func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	_ = ctx //TODO
+
+	// Для орагизации извлечения ссылок и дальнейшей их обработки создадим очередь
+	queue := make([]AliveInnerLink, 0, initQueueCapacity)
+
+	isVisited := make(map[string]struct{})
+
 	var pages []Page
 
-	// Делаем запрос на базовый URL get запросом для извлечения тела - html
-	// Создаем новый запрос
-	req, err := http.NewRequest("GET", opts.URL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make request: %w", err)
-	}
+	// Это старт очереди с глубиной 0
+	queue = append(queue, AliveInnerLink{
+		URL:       opts.URL,
+		LinkDepth: 0,
+	})
 
-	// Устанавливаем User-Agent (имитируем реальный браузер)
-	req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+	for len(queue) > 0 {
+		item := queue[0]
 
-	// Выполняем запрос
-	resp, err := opts.HTTPClient.Do(req)
-	if err != nil {
-		if resp != nil {
-			resp.Body.Close() // Даже при ошибке resp может быть не nil!
+		fmt.Printf("FIRST ELEMENT =  %v\n", item.URL)
+
+		if item.LinkDepth <= opts.Depth {
+			queue = queue[1:]
+
+			if _, ok := isVisited[item.URL]; ok {
+				continue
+			}
+
+			// Создаем новый запрос
+			req, err := http.NewRequest("GET", item.URL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to make request: %w", err)
+			}
+
+			// Устанавливаем User-Agent (имитируем реальный браузер)
+			req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+
+			// Выполняем запрос
+			resp, err := opts.HTTPClient.Do(req)
+			if err != nil {
+				if resp != nil {
+					resp.Body.Close() // Даже при ошибке resp может быть не nil!
+				}
+				return nil, fmt.Errorf("get request failed: %w", err)
+			}
+
+			// Сохраним body для дальнейшей работы в разных местах
+			savedBody, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to save body: %w", err)
+			}
+
+			// Извлекаем ссылки из страницы
+			links := checkHTML(bytes.NewReader(savedBody))
+
+			// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
+			URLs, err := ProcessLinks(links, &opts)
+			if err != nil {
+				return nil, fmt.Errorf("ProcessLinks: %w", err)
+			}
+
+			// Сделаем запросы к найденным URL и сформируем слайс битых ссылок
+			brLinks, err := ArrangeLinks(URLs, opts, item, &queue)
+			if err != nil {
+				return nil, fmt.Errorf("ArrangeLinks: %w", err)
+			}
+
+			// Соберём SEO из полученной html страницы
+			seo, err := CollectSEO(bytes.NewReader(savedBody))
+			if err != nil {
+				return nil, fmt.Errorf("CollectSEO: %w", err)
+			}
+
+			pages = append(pages, Page{
+				URL:          item.URL,
+				Depth:        item.LinkDepth,
+				HTTPStatus:   resp.StatusCode,
+				Status:       resp.Status,
+				Error:        "",
+				Seo:          seo,
+				BrokenLinks:  brLinks,
+				DiscoveredAt: time.Now(),
+			})
+
+			//for i, v := range queue {
+			//	fmt.Printf("FINISH queue %v = %v\n", i, v.URL)
+			//}
 		}
-		return nil, fmt.Errorf("get request failed: %w", err)
+
+		isVisited[item.URL] = struct{}{}
 	}
-
-	// Сохраним body для дальнейшей работы в разных местах
-	savedBody, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("failed to save body: %w", err)
-	}
-
-	// Извлекаем ссылки из стартовой страницы
-	links := checkHTML(bytes.NewReader(savedBody))
-
-	// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-	URLs, err := ProcessLinks(links, &opts)
-	if err != nil {
-		return nil, fmt.Errorf("ProcessLinks: %w", err)
-	}
-
-	// Сделаем запросы к найденным URL и сформируем слайс битых ссылок
-	brLinks, err := FindBrokenLinks(URLs, opts)
-	if err != nil {
-		return nil, fmt.Errorf("FindBrokenLinks: %w", err)
-	}
-
-	// Соберём SEO из полученной html страницы
-	seo, err := CollectSEO(bytes.NewReader(savedBody))
-	if err != nil {
-		return nil, fmt.Errorf("CollectSEO: %w", err)
-	}
-
-	page := Page{
-		URL:          opts.URL,
-		Depth:        opts.Depth,
-		HTTPStatus:   resp.StatusCode,
-		Status:       resp.Status,
-		Error:        "",
-		Seo:          seo,
-		BrokenLinks:  brLinks,
-		DiscoveredAt: time.Now(),
-	}
-
-	pages = append(pages, page)
 
 	data := Response{
 		RootURL:     opts.URL,
@@ -194,30 +230,62 @@ func isValidURL(rawURL string) bool {
 	return supportedSchemes[parsed.Scheme]
 }
 
-func FindBrokenLinks(URLs []string, opts Options) ([]BrokenLinks, error) {
-	var brLinks []BrokenLinks
-	var brLink BrokenLinks
+func isInnerLink(checkedURL string, item AliveInnerLink) bool {
+	// Парсим базовый URL
+	baseParsed, err := url.Parse(item.URL)
+	if err != nil {
+		slog.Error("failed to parse base URL", "url", item.URL, "error", err)
+		return false
+	}
 
-	for _, u := range URLs {
+	// Парсим проверяемый URL
+	checkedParsed, err := url.Parse(checkedURL)
+	if err != nil {
+		slog.Error("failed to parse checked URL", "url", checkedURL, "error", err)
+		return false
+	}
+
+	// Если ссылка относительная - она внутренняя
+	if !checkedParsed.IsAbs() {
+		return true
+	}
+
+	// Сравниваем хосты
+	return baseParsed.Host == checkedParsed.Host
+}
+
+func ArrangeLinks(extractedURLs []string, opts Options, item AliveInnerLink, queue *[]AliveInnerLink) ([]BrokenLinks, error) {
+	var brLinks []BrokenLinks
+
+	for _, u := range extractedURLs {
 		resp, err := makeHEADorGETRequest(u, opts)
 		if err != nil {
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
-			brLink = BrokenLinks{
+			brLinks = append(brLinks, BrokenLinks{
 				URL: u,
 				Err: err.Error(),
-			}
-			brLinks = append(brLinks, brLink)
+			})
 			continue
 		}
+		resp.Body.Close()
 
-		if resp.StatusCode >= 400 {
-			brLink = BrokenLinks{
+		switch {
+		case resp.StatusCode >= http.StatusBadRequest:
+			brLinks = append(brLinks, BrokenLinks{
 				URL:        u,
 				StatusCode: resp.StatusCode,
+			})
+
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			if isInnerLink(u, item) && item.LinkDepth < opts.Depth {
+				*queue = append(*queue, AliveInnerLink{
+					URL:       u,
+					LinkDepth: item.LinkDepth + 1,
+				})
 			}
-			brLinks = append(brLinks, brLink)
+		default:
+			slog.Warn("unexpected StatusCode", "url", u, "StatusCode", resp.StatusCode)
 		}
-		resp.Body.Close()
 	}
 	return brLinks, nil
 }
