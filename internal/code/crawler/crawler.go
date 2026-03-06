@@ -19,6 +19,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	"golang.org/x/time/rate"
 )
 
 const initQueueCapacity = 500
@@ -103,6 +104,10 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		cancel() // отменяем контекст при получении сигнала
 	}()
 
+	// создадим лимитер, который будет ограничивать количество запросов в единицу времени на уровне всего приложения
+	// с учётом количества воркеров
+	//limiter := Limiter(&opts)
+
 	// инициализируем структуру, которая собирает посещения и контроллирует конкурентный доступ к данным
 	visits := NewVisits()
 
@@ -124,139 +129,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 
 	for i := 1; i <= opts.Concurrency; i++ {
 		go func(indx int) {
-			slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
-
-			for item := range queueCh {
-
-				var page Page
-
-				if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
-					slog.Debug("context done, stopping worker", "goroutine_id", indx)
-					page.Error = ctx.Err().Error()
-					errsCh <- fmt.Errorf("timeout: %w", ctx.Err())
-					atomic.AddInt32(&pendingURLs, -1)
-					continue
-				}
-
-				if item.LinkDepth > opts.Depth {
-					atomic.AddInt32(&pendingURLs, -1)
-					continue
-				}
-
-				visits.mu.Lock()
-				if _, ok := visits.isVisited[item.URL]; ok {
-					visits.mu.Unlock()
-					atomic.AddInt32(&pendingURLs, -1)
-					continue
-				}
-				visits.isVisited[item.URL] = struct{}{}
-				visits.mu.Unlock()
-
-				// теперь обрабатываем страницу
-				// Создаем новый запрос
-				req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
-				if err != nil {
-					page.Error = err.Error()
-					errsCh <- fmt.Errorf("failed to make request: %w", err)
-					continue
-				}
-
-				// Устанавливаем User-Agent (имитируем реальный браузер)
-				req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-				// Выполняем запрос
-				resp, err := opts.HTTPClient.Do(req)
-				if err != nil {
-					page.Error = err.Error()
-					if resp != nil {
-						resp.Body.Close() // Даже при ошибке resp может быть не nil!
-					}
-					errsCh <- fmt.Errorf("get request failed: %w", err)
-					continue
-				}
-
-				// Сохраним body для дальнейшей работы в разных местах
-				savedBody, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err != nil {
-					page.Error = err.Error()
-					errsCh <- fmt.Errorf("failed to save body: %w", err)
-					continue
-				}
-
-				// Извлекаем ссылки из страницы
-				links := checkHTML(bytes.NewReader(savedBody))
-
-				// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-				URLs, err := ProcessLinks(links, &opts)
-				if err != nil {
-					page.Error = err.Error()
-					errsCh <- fmt.Errorf("ProcessLinks: %w", err)
-					continue
-				}
-
-				var brLinks []BrokenLinks
-
-				for _, u := range URLs {
-					resp, err := makeHEADorGETRequest(ctx, u, opts)
-					if err != nil {
-						//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
-						brLinks = append(brLinks, BrokenLinks{
-							URL: u,
-							Err: err.Error(),
-						})
-						continue
-					}
-					resp.Body.Close()
-
-					switch {
-					case resp.StatusCode >= http.StatusBadRequest:
-						brLinks = append(brLinks, BrokenLinks{
-							URL:        u,
-							StatusCode: resp.StatusCode,
-						})
-
-					case resp.StatusCode >= 200 && resp.StatusCode < 300:
-						if isInnerLink(u, item) && item.LinkDepth < opts.Depth { //!!! было не верное условие и не выходил из цикла
-							atomic.AddInt32(&pendingURLs, 1)
-							select {
-							case queueCh <- AliveInnerLink{
-								URL:       u,
-								LinkDepth: item.LinkDepth + 1,
-							}:
-							default:
-								// если буферизованный канал полон, то возвращаем счётчик обратно
-								atomic.AddInt32(&pendingURLs, -1)
-								slog.Warn("queueCh is full")
-							}
-						}
-					default:
-						slog.Warn("unexpected StatusCode", "url", u, "StatusCode", resp.StatusCode)
-					}
-				}
-
-				// Соберём SEO из полученной html страницы
-				seo, err := CollectSEO(bytes.NewReader(savedBody))
-				if err != nil {
-					page.Error = err.Error()
-					errsCh <- fmt.Errorf("CollectSEO: %w", err)
-					continue
-				}
-
-				page.URL = item.URL
-				page.Depth = item.LinkDepth
-				page.HTTPStatus = resp.StatusCode
-				page.Status = resp.Status
-				page.Seo = seo
-				page.BrokenLinks = brLinks
-				page.DiscoveredAt = time.Now()
-
-				pagesCh <- page
-
-				atomic.AddInt32(&pendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
-			}
-			done <- struct{}{} //сигнал от каждой горутины, что работа окончена
-			slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
+			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits)
 		}(i)
 	}
 
@@ -313,10 +186,6 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 				continue
 			}
 			errs = append(errs, err)
-		case <-ctx.Done():
-			// контекст отменён, прекращаем сбор
-			pagesCh = nil
-			errsCh = nil
 		}
 	}
 
@@ -339,6 +208,113 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	}
 
 	return report, firstErr
+}
+
+func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
+	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits) {
+	slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
+
+	for item := range queueCh {
+		var page Page
+
+		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
+			slog.Debug("context done, stopping worker", "goroutine_id", indx)
+			page.Error = ctx.Err().Error()
+			errsCh <- fmt.Errorf("timeout: %w", ctx.Err())
+			atomic.AddInt32(pendingURLs, -1)
+			continue
+		}
+
+		if item.LinkDepth > opts.Depth {
+			atomic.AddInt32(pendingURLs, -1)
+			continue
+		}
+
+		visits.mu.Lock()
+		if _, ok := visits.isVisited[item.URL]; ok {
+			visits.mu.Unlock()
+			atomic.AddInt32(pendingURLs, -1)
+			continue
+		}
+		visits.isVisited[item.URL] = struct{}{}
+		visits.mu.Unlock()
+
+		// теперь обрабатываем страницу
+		// Создаем новый запрос
+		//if err := limiter.Wait(ctx); err != nil {
+		//	slog.Warn("context", "ctx_error", ctx.Err())
+		//	continue
+		//}
+		req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("failed to make request: %w", err)
+			continue
+		}
+
+		// Устанавливаем User-Agent (имитируем реальный браузер)
+		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+
+		// Выполняем запрос
+		resp, err := opts.HTTPClient.Do(req)
+		if err != nil {
+			page.Error = err.Error()
+			if resp != nil {
+				resp.Body.Close() // Даже при ошибке resp может быть не nil!
+			}
+			errsCh <- fmt.Errorf("get request failed: %w", err)
+			continue
+		}
+
+		// Сохраним body для дальнейшей работы в разных местах
+		savedBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("failed to save body: %w", err)
+			continue
+		}
+
+		// Извлекаем ссылки из страницы
+		links := checkHTML(bytes.NewReader(savedBody))
+
+		// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
+		URLs, err := ProcessLinks(links, &opts)
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("ProcessLinks: %w", err)
+			continue
+		}
+
+		brLinks, err := ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs)
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("ArrangeLinks: %w", err)
+			continue
+		}
+
+		// Соберём SEO из полученной html страницы
+		seo, err := CollectSEO(bytes.NewReader(savedBody))
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("CollectSEO: %w", err)
+			continue
+		}
+
+		page.URL = item.URL
+		page.Depth = item.LinkDepth
+		page.HTTPStatus = resp.StatusCode
+		page.Status = resp.Status
+		page.Seo = seo
+		page.BrokenLinks = brLinks
+		page.DiscoveredAt = time.Now()
+
+		pagesCh <- page
+
+		atomic.AddInt32(pendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
+	}
+	done <- struct{}{} //сигнал от каждой горутины, что работа окончена
+	slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
 }
 
 func checkHTML(r io.Reader) []string {
@@ -501,4 +477,68 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 		repeated[l] = struct{}{}
 	}
 	return URLs, nil
+}
+
+func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink, pendingURLs *int32) ([]BrokenLinks, error) {
+	var brLinks []BrokenLinks
+
+	for _, u := range URLs {
+		//if err := limiter.Wait(ctx); err != nil {
+		//	slog.Warn("context", "ctx_error", ctx.Err())
+		//	continue
+		//}
+		resp, err := makeHEADorGETRequest(ctx, u, opts)
+		if err != nil {
+			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
+			brLinks = append(brLinks, BrokenLinks{
+				URL: u,
+				Err: err.Error(),
+			})
+			continue
+		}
+		resp.Body.Close()
+
+		switch {
+		case resp.StatusCode >= http.StatusBadRequest:
+			brLinks = append(brLinks, BrokenLinks{
+				URL:        u,
+				StatusCode: resp.StatusCode,
+			})
+
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			if isInnerLink(u, item) && item.LinkDepth < opts.Depth { //!!! было не верное условие и не выходил из цикла
+				atomic.AddInt32(pendingURLs, 1)
+				select {
+				case queueCh <- AliveInnerLink{
+					URL:       u,
+					LinkDepth: item.LinkDepth + 1,
+				}:
+				default:
+					// если буферизованный канал полон, то возвращаем счётчик обратно
+					atomic.AddInt32(pendingURLs, -1)
+					slog.Warn("queueCh is full")
+				}
+			}
+		default:
+			slog.Warn("unexpected StatusCode", "url", u, "StatusCode", resp.StatusCode)
+		}
+	}
+	return brLinks, nil
+}
+
+func Limiter(opts *Options) *rate.Limiter {
+	var limit rate.Limit
+	switch {
+	case opts.Retries != 0 && opts.Delay != 0:
+		limit = rate.Limit(opts.Retries)
+		fmt.Printf("RPS = %v", limit)
+	case opts.Retries == 0:
+		limit = rate.Limit(int(1000 / opts.Delay))
+		fmt.Printf("convert delay = %d into RPS = %v", opts.Delay, limit)
+	case opts.Delay == 0:
+		limit = rate.Limit(opts.Retries)
+	default:
+		limit = rate.Inf
+	}
+	return rate.NewLimiter(limit, opts.Concurrency)
 }

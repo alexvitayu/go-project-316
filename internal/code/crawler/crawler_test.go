@@ -45,9 +45,10 @@ func TestAnalyze(t *testing.T) {
 			}),
 			options: func(server *httptest.Server) crawler.Options {
 				return crawler.Options{
-					URL:        server.URL,
-					HTTPClient: &http.Client{},
-					Timeout:    15 * time.Second,
+					URL:         server.URL,
+					HTTPClient:  &http.Client{},
+					Timeout:     30 * time.Second,
+					Concurrency: 2,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -83,9 +84,10 @@ func TestAnalyze(t *testing.T) {
 			}),
 			options: func(server *httptest.Server) crawler.Options {
 				return crawler.Options{
-					URL:        server.URL,
-					HTTPClient: &http.Client{},
-					Timeout:    15 * time.Second,
+					URL:         server.URL,
+					HTTPClient:  &http.Client{},
+					Timeout:     15 * time.Second,
+					Concurrency: 1,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -120,9 +122,10 @@ func TestAnalyze(t *testing.T) {
 			}),
 			options: func(server *httptest.Server) crawler.Options {
 				return crawler.Options{
-					URL:        server.URL,
-					HTTPClient: &http.Client{},
-					Timeout:    15 * time.Second,
+					URL:         server.URL,
+					HTTPClient:  &http.Client{},
+					Timeout:     15 * time.Second,
+					Concurrency: 4,
 				}
 			},
 			wantResponse: crawler.Response{
@@ -148,7 +151,8 @@ func TestAnalyze(t *testing.T) {
 					HTTPClient: &http.Client{
 						Timeout: 2 * time.Millisecond,
 					},
-					Timeout: 15 * time.Second,
+					Timeout:     3 * time.Second,
+					Concurrency: 1,
 				}
 			},
 			wantErr:    context.DeadlineExceeded,
@@ -158,9 +162,10 @@ func TestAnalyze(t *testing.T) {
 			name: "connection_refused",
 			options: func(_ *httptest.Server) crawler.Options {
 				return crawler.Options{
-					URL:        "http://localhost:65535",
-					HTTPClient: &http.Client{},
-					Timeout:    15 * time.Second,
+					URL:         "http://localhost:65535",
+					HTTPClient:  &http.Client{},
+					Timeout:     1 * time.Second,
+					Concurrency: 1,
 				}
 			},
 			wantErr:    syscall.ECONNREFUSED,
@@ -206,11 +211,12 @@ func TestArrangeLinks(t *testing.T) {
 			"https://www.google.com/non-existent-page", "https://wooordhunt.ru/word/хтрй"}
 
 		item := crawler.AliveInnerLink{}
-		queue := make([]crawler.AliveInnerLink, 0)
+		queueCh := make(chan crawler.AliveInnerLink)
+		var pendingURLs int32 = 0
 
 		wantLengthBroken := 2
 
-		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, &queue)
+		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs)
 		require.NoError(t, err)
 		assert.Len(t, broken, wantLengthBroken)
 	})
