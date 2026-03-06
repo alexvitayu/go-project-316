@@ -20,7 +20,7 @@ func main() {
 
 	cfg, err := config.LoadCfg()
 	if err != nil {
-		fmt.Println(err)
+		slog.Error("LoadConfig", "error", err)
 	}
 
 	customLogger := logger.SetupLogger(cfg)
@@ -83,7 +83,7 @@ func main() {
 			retries := cmd.Int("retries")
 			delay := cmd.Duration("delay")
 			timeout := cmd.Duration("timeout")
-			//rps := cmd.Int("rps") //TODO
+			rps := cmd.Int("rps")
 			agent := cmd.String("user-agent")
 			workers := cmd.Int("workers")
 
@@ -101,6 +101,7 @@ func main() {
 				Concurrency: workers,
 				IndentJSON:  "  ",
 				HTTPClient:  &client,
+				RPS:         rps,
 			}
 
 			report, err := crawler.Analyze(ctx, options)

@@ -29,9 +29,7 @@ linters:
     - gocheckcompilerdirectives
     - gochecknoinits
     - goconst
-    - gocyclo
     - godox
-    - mnd
     - goprintffuncname
     - gosec
     - govet

@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 func TestAnalyze(t *testing.T) {
@@ -213,10 +214,11 @@ func TestArrangeLinks(t *testing.T) {
 		item := crawler.AliveInnerLink{}
 		queueCh := make(chan crawler.AliveInnerLink)
 		var pendingURLs int32 = 0
+		limiter := rate.NewLimiter(rate.Inf, 1)
 
 		wantLengthBroken := 2
 
-		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs)
+		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter)
 		require.NoError(t, err)
 		assert.Len(t, broken, wantLengthBroken)
 	})
@@ -268,6 +270,58 @@ func TestCollectSEO(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantSEO, seo)
 			resp.Body.Close()
+		})
+	}
+}
+
+func TestSetLimit(t *testing.T) {
+	t.Parallel()
+	var testCases = []struct {
+		name      string
+		opts      crawler.Options
+		wantLimit float64
+	}{
+		{
+			name:      "not_set_rps_and_delay",
+			opts:      crawler.Options{},
+			wantLimit: 0,
+		},
+		{
+			name: "set_delay_millisecond",
+			opts: crawler.Options{
+				Delay: 250 * time.Millisecond,
+			},
+			wantLimit: 4,
+		},
+		{
+			name: "set_delay_second",
+			opts: crawler.Options{
+				Delay: 4 * time.Second,
+			},
+			wantLimit: 0.25,
+		},
+		{
+			name: "set_rps_and_delay",
+			opts: crawler.Options{
+				Delay: 4 * time.Second,
+				RPS:   3,
+			},
+			wantLimit: 3,
+		},
+		{
+			name: "set_rps",
+			opts: crawler.Options{
+				RPS: 4,
+			},
+			wantLimit: 4,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := crawler.SetLimit(&tc.opts)
+			assert.InDelta(t, tc.wantLimit, got, 0.0001)
 		})
 	}
 }

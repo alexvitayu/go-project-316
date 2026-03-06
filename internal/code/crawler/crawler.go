@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -39,6 +40,7 @@ type Options struct {
 	Concurrency int
 	IndentJSON  string
 	HTTPClient  *http.Client
+	RPS         int
 }
 
 type Page struct {
@@ -104,9 +106,15 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		cancel() // отменяем контекст при получении сигнала
 	}()
 
-	// создадим лимитер, который будет ограничивать количество запросов в единицу времени на уровне всего приложения
-	// с учётом количества воркеров
-	//limiter := Limiter(&opts)
+	lim := SetLimit(&opts)
+	fmt.Printf("rps = %v\n", lim)
+	var limit rate.Limit
+	if lim <= 0 {
+		limit = rate.Inf
+	} else if lim > 0 {
+		limit = rate.Limit(lim)
+	}
+	limiter := rate.NewLimiter(limit, opts.Concurrency)
 
 	// инициализируем структуру, которая собирает посещения и контроллирует конкурентный доступ к данным
 	visits := NewVisits()
@@ -129,7 +137,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 
 	for i := 1; i <= opts.Concurrency; i++ {
 		go func(indx int) {
-			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits)
+			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits, limiter)
 		}(i)
 	}
 
@@ -142,7 +150,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 				// Принудительно закрываем каналы
 				close(queueCh)
 				// Ждём завершения воркеров
-				for i := 0; i < opts.Concurrency; i++ { // каждый из воркеров должен прислать сигнал done
+				for range opts.Concurrency { // каждый из воркеров должен прислать сигнал done
 					<-done
 				}
 				close(errsCh)
@@ -155,7 +163,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 					slog.Info("all URLs processed, shutting down")
 					close(queueCh)
 					// Ждём завершения воркеров
-					for i := 0; i < opts.Concurrency; i++ {
+					for range opts.Concurrency {
 						<-done
 					}
 					close(errsCh)
@@ -211,8 +219,13 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 }
 
 func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
-	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits) {
+	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits, limiter *rate.Limiter) {
 	slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
+
+	defer func() {
+		done <- struct{}{} //сигнал от каждой горутины, что работа окончена
+		slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
+	}()
 
 	for item := range queueCh {
 		var page Page
@@ -220,7 +233,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
 			slog.Debug("context done, stopping worker", "goroutine_id", indx)
 			page.Error = ctx.Err().Error()
-			errsCh <- fmt.Errorf("timeout: %w", ctx.Err())
+			errsCh <- fmt.Errorf("context: %w", ctx.Err())
 			atomic.AddInt32(pendingURLs, -1)
 			continue
 		}
@@ -241,10 +254,12 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 
 		// теперь обрабатываем страницу
 		// Создаем новый запрос
-		//if err := limiter.Wait(ctx); err != nil {
-		//	slog.Warn("context", "ctx_error", ctx.Err())
-		//	continue
-		//}
+		if err := limiter.Wait(ctx); err != nil {
+			slog.Warn("rate limiter, method wait failed", "error", err)
+			errsCh <- fmt.Errorf("rate limiter: %w", err)
+			atomic.AddInt32(pendingURLs, -1)
+			return
+		}
 		req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
 		if err != nil {
 			page.Error = err.Error()
@@ -286,7 +301,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
-		brLinks, err := ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs)
+		brLinks, err := ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter)
 		if err != nil {
 			page.Error = err.Error()
 			errsCh <- fmt.Errorf("ArrangeLinks: %w", err)
@@ -313,8 +328,6 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 
 		atomic.AddInt32(pendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
 	}
-	done <- struct{}{} //сигнал от каждой горутины, что работа окончена
-	slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
 }
 
 func checkHTML(r io.Reader) []string {
@@ -479,14 +492,16 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 	return URLs, nil
 }
 
-func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink, pendingURLs *int32) ([]BrokenLinks, error) {
+func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
+	pendingURLs *int32, limiter *rate.Limiter) ([]BrokenLinks, error) {
 	var brLinks []BrokenLinks
 
 	for _, u := range URLs {
-		//if err := limiter.Wait(ctx); err != nil {
-		//	slog.Warn("context", "ctx_error", ctx.Err())
-		//	continue
-		//}
+		if err := limiter.Wait(ctx); err != nil {
+			slog.Error("rate limiter", "error", err)
+			atomic.AddInt32(pendingURLs, -1)
+			return brLinks, fmt.Errorf("rate limiter: %w", err)
+		}
 		resp, err := makeHEADorGETRequest(ctx, u, opts)
 		if err != nil {
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
@@ -526,19 +541,24 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 	return brLinks, nil
 }
 
-func Limiter(opts *Options) *rate.Limiter {
-	var limit rate.Limit
+func SetLimit(opts *Options) float64 {
+	var limit float64
 	switch {
-	case opts.Retries != 0 && opts.Delay != 0:
-		limit = rate.Limit(opts.Retries)
-		fmt.Printf("RPS = %v", limit)
-	case opts.Retries == 0:
-		limit = rate.Limit(int(1000 / opts.Delay))
-		fmt.Printf("convert delay = %d into RPS = %v", opts.Delay, limit)
-	case opts.Delay == 0:
-		limit = rate.Limit(opts.Retries)
+	case opts.RPS != 0 && opts.Delay != 0:
+		limit = float64(opts.RPS)
+
+	case opts.RPS == 0 && opts.Delay != 0:
+		str := opts.Delay.String()
+		if strings.HasSuffix(str, "ms") {
+			limit = float64(1000*time.Millisecond) / float64(opts.Delay)
+		} else if strings.HasSuffix(str, "s") {
+			limit = float64(time.Second) / float64(opts.Delay)
+		}
+
+	case opts.Delay == 0 && opts.RPS != 0:
+		limit = float64(opts.RPS)
 	default:
-		limit = rate.Inf
+		limit = 0
 	}
-	return rate.NewLimiter(limit, opts.Concurrency)
+	return limit
 }
