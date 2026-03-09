@@ -1,11 +1,18 @@
 package crawler_test
 
 import (
+	"bytes"
 	"code/internal/code/crawler"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sort"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -324,4 +331,319 @@ func TestSetLimit(t *testing.T) {
 			assert.InDelta(t, tc.wantLimit, got, 0.0001)
 		})
 	}
+}
+
+func TestLimiter_TimeBetweenRequests(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		name         string
+		rps          int
+		delay        time.Duration
+		workers      int
+		reqPerWorker int
+		burst        int
+	}{
+		{
+			name:         "Delay 200ms -> 5 RPS, 3 workers",
+			rps:          0,
+			delay:        200 * time.Millisecond,
+			workers:      3,
+			reqPerWorker: 4,
+		},
+		{
+			name:         "RPS 3 has priority over delay 100ms",
+			rps:          3,
+			delay:        100 * time.Millisecond,
+			workers:      2,
+			reqPerWorker: 5,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			limiter := rate.NewLimiter(rate.Limit(crawler.SetLimit(&crawler.Options{
+				Delay: tc.delay,
+				RPS:   tc.rps,
+			})), tc.workers)
+
+			var wg sync.WaitGroup
+			requestTimes := make([][]time.Time, tc.workers) // вместит в себя сумму всех времён запросов от всех воркеров
+
+			start := time.Now()
+
+			for w := 0; w < tc.workers; w++ {
+				wg.Add(1)
+				go func(workerID int) {
+					defer wg.Done()
+					times := make([]time.Time, 0, tc.reqPerWorker)
+
+					for range tc.reqPerWorker {
+						err := limiter.Wait(t.Context()) // здесь лимитер создаёт определённую задержку между запросами
+						require.NoError(t, err)
+						times = append(times, time.Now()) // сюда складываются текущие времена выполнения запросов
+					}
+
+					requestTimes[workerID] = times
+				}(w)
+			}
+
+			wg.Wait()
+
+			// Собираем и сортируем все времена
+			allTimes := make([]time.Time, 0)
+			for _, times := range requestTimes {
+				allTimes = append(allTimes, times...)
+			}
+			sort.Slice(allTimes, func(i, j int) bool {
+				return allTimes[i].Before(allTimes[j])
+			})
+
+			// Проверяем общее время
+			totalTime := time.Since(start)
+			totalReqs := tc.workers * tc.reqPerWorker
+			limit := limiter.Limit()
+
+			if limit > 0 {
+				expectedMinTime := time.Duration(float64(totalReqs-tc.workers) / float64(limit) * float64(time.Second))
+				if totalTime < expectedMinTime-100*time.Millisecond {
+					t.Errorf("Total time %v is less than expected %v",
+						totalTime, expectedMinTime)
+				}
+			}
+		})
+	}
+}
+
+func TestDoRequestWithRetries_NoError(t *testing.T) {
+	t.Parallel()
+	var testCases = []struct {
+		name             string
+		method           string
+		opts             crawler.Options
+		handler          func(*int) http.HandlerFunc
+		wantRequestCount int
+		wantStatus       int
+	}{
+		{
+			name:   "429_response",
+			method: "HEAD",
+			opts: crawler.Options{
+				Retries:    3,
+				HTTPClient: &http.Client{},
+			},
+			handler: func(counter *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					(*counter)++ // увеличиваем счетчик
+
+					if *counter <= 2 {
+						w.WriteHeader(http.StatusTooManyRequests)
+						w.Write([]byte("too many requests"))
+					} else {
+						w.WriteHeader(http.StatusOK)
+						w.Write([]byte("OK"))
+					}
+				}
+			},
+			wantRequestCount: 3,
+			wantStatus:       http.StatusOK,
+		},
+		{
+			name:   "500_response",
+			method: "GET",
+			opts: crawler.Options{
+				Retries:    4,
+				HTTPClient: &http.Client{},
+			},
+			handler: func(counter *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					(*counter)++ // увеличиваем счетчик
+
+					if *counter <= 3 {
+						w.WriteHeader(http.StatusInternalServerError)
+						w.Write([]byte("internal server error"))
+					} else {
+						w.WriteHeader(http.StatusOK)
+						w.Write([]byte("OK"))
+					}
+				}
+			},
+			wantRequestCount: 4,
+			wantStatus:       http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			requestCount := 0
+
+			handler := tc.handler(&requestCount)
+
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			req, err := http.NewRequestWithContext(t.Context(), tc.method, server.URL, nil)
+			require.NoError(t, err)
+
+			resp, err := crawler.DoRequestWithRetries(req, tc.opts)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, tc.wantStatus, resp.StatusCode)
+			assert.Equal(t, tc.wantRequestCount, requestCount)
+		})
+	}
+}
+
+func TestDoRequestWithRetries_WithError(t *testing.T) {
+	t.Parallel()
+
+	type response struct {
+		statusCode int
+		err        error
+	}
+	var testCases = []struct {
+		name             string
+		method           string
+		opts             crawler.Options
+		responses        []response
+		wantRequestCount int
+		isErr            bool
+		wantStatus       int
+		wantErr          string
+	}{
+		{
+			name:   "429_response -> retry -> success",
+			method: "HEAD",
+			opts: crawler.Options{
+				Retries:    1,
+				HTTPClient: &http.Client{},
+			},
+			responses: []response{
+				{429, nil},
+				{200, nil},
+			},
+			wantRequestCount: 2,
+			wantStatus:       http.StatusOK,
+		},
+		{
+			name:   "500_response -> two_retries -> success",
+			method: "GET",
+			opts: crawler.Options{
+				Retries:    2,
+				HTTPClient: &http.Client{},
+			},
+			responses: []response{
+				{500, nil},
+				{500, nil},
+				{200, nil},
+			},
+			wantRequestCount: 3,
+			wantStatus:       http.StatusOK,
+		},
+		{
+			name:   "one_retry_with_error -> error",
+			method: "GET",
+			opts: crawler.Options{
+				Retries:    1,
+				HTTPClient: &http.Client{},
+			},
+			responses: []response{
+				{0, &net.OpError{
+					Err: &os.SyscallError{
+						Syscall: "connect",
+						Err:     syscall.ENETUNREACH,
+					},
+				}},
+				{0, &net.OpError{
+					Err: &os.SyscallError{
+						Syscall: "connect",
+						Err:     syscall.ENETUNREACH,
+					},
+				}},
+			},
+			wantRequestCount: 2,
+			wantStatus:       0,
+			wantErr:          "network is unreachable",
+			isErr:            true,
+		},
+		{
+			name:   "second_retry_successful -> success",
+			method: "GET",
+			opts: crawler.Options{
+				Retries:    2,
+				HTTPClient: &http.Client{},
+			},
+			responses: []response{
+				{0, &net.OpError{
+					Err: &os.SyscallError{
+						Syscall: "connect",
+						Err:     syscall.ENETUNREACH,
+					},
+				}},
+				{0, &net.OpError{
+					Err: &os.SyscallError{
+						Syscall: "connect",
+						Err:     syscall.ENETUNREACH,
+					},
+				}},
+				{200, nil},
+			},
+			wantRequestCount: 3,
+			wantStatus:       200,
+			isErr:            false,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			requestCount := 0
+			transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if requestCount >= len(tc.responses) {
+					return nil, fmt.Errorf("unexpected request #%d", requestCount)
+				}
+
+				respSeq := tc.responses[requestCount]
+				requestCount++
+
+				if respSeq.err != nil {
+					return nil, respSeq.err
+				}
+				return &http.Response{
+					StatusCode: respSeq.statusCode,
+					Status:     http.StatusText(respSeq.statusCode),
+					Body:       io.NopCloser(bytes.NewBufferString("response")),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			})
+			tc.opts.HTTPClient.Transport = transport
+
+			req, err := http.NewRequestWithContext(t.Context(), tc.method, "https://test.com", nil)
+			require.NoError(t, err)
+
+			resp, err := crawler.DoRequestWithRetries(req, tc.opts)
+			if tc.isErr {
+				require.Error(t, err)
+				if tc.wantErr != "" {
+					assert.Contains(t, err.Error(), tc.wantErr)
+				}
+			} else {
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				assert.Equal(t, tc.wantStatus, resp.StatusCode)
+			}
+
+			assert.Equal(t, tc.wantRequestCount, requestCount)
+		})
+	}
+}
+
+type roundTripperFunc func(r *http.Request) (*http.Response, error)
+
+func (rf roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rf(req)
 }

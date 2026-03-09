@@ -106,13 +106,14 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		cancel() // отменяем контекст при получении сигнала
 	}()
 
-	lim := SetLimit(&opts)
-	fmt.Printf("rps = %v\n", lim)
+	// введём limiter, с его помощью ограничиваем число запросов в единицу времени и используем его
+	// как шлагбаум в местах запросов
+	rps := SetLimit(&opts)
 	var limit rate.Limit
-	if lim <= 0 {
-		limit = rate.Inf
-	} else if lim > 0 {
-		limit = rate.Limit(lim)
+	if rps <= 0 {
+		limit = rate.Inf // количество запросов за секунду не ограничено
+	} else if rps > 0 {
+		limit = rate.Limit(rps)
 	}
 	limiter := rate.NewLimiter(limit, opts.Concurrency)
 
@@ -271,9 +272,9 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
 
 		// Выполняем запрос
-		resp, err := opts.HTTPClient.Do(req)
+		//resp, err := opts.HTTPClient.Do(req)
+		resp, err := DoRequestWithRetries(req, opts)
 		if err != nil {
-			page.Error = err.Error()
 			if resp != nil {
 				resp.Body.Close() // Даже при ошибке resp может быть не nil!
 			}
@@ -413,7 +414,8 @@ func makeHEADorGETRequest(ctx context.Context, url string, opts Options) (*http.
 	// Устанавливаем User-Agent (имитируем реальный браузер)
 	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
 
-	headResp, err := opts.HTTPClient.Do(headReq)
+	//headResp, err := opts.HTTPClient.Do(headReq)
+	headResp, err := DoRequestWithRetries(headReq, opts)
 	if err != nil {
 		return makeGetRequest(ctx, url, opts)
 	}
@@ -435,7 +437,8 @@ func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Respon
 
 	getReq.Header.Set("User-Agent", opts.UserAgent)
 
-	getResp, err := opts.HTTPClient.Do(getReq)
+	//getResp, err := opts.HTTPClient.Do(getReq)
+	getResp, err := DoRequestWithRetries(getReq, opts)
 	if err != nil {
 		return nil, fmt.Errorf("fail to make get request: %w", err)
 	}
@@ -561,4 +564,63 @@ func SetLimit(opts *Options) float64 {
 		limit = 0
 	}
 	return limit
+}
+
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.Contains(err.Error(), "connection reset") ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection refused") ||
+		strings.Contains(err.Error(), "no such host") ||
+		strings.Contains(err.Error(), "network is unreachable") {
+		return true
+	}
+	return false
+}
+
+func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	for attempt := 0; attempt <= opts.Retries; attempt++ {
+		resp, err = opts.HTTPClient.Do(req)
+
+		shouldRetry := false
+
+		if err != nil {
+			if isNetworkError(err) {
+				shouldRetry = true
+				slog.Debug("network error, retrying request",
+					"attempt", attempt,
+					"error", err,
+					"url", req.URL.String())
+			}
+		} else {
+			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				shouldRetry = true
+				slog.Debug("retrying request",
+					"attempt", attempt,
+					"statusCode", resp.StatusCode,
+					"url", req.URL.String())
+			}
+		}
+
+		if !shouldRetry {
+			return resp, err
+		}
+
+		if attempt == opts.Retries {
+			return resp, err
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+	return resp, err
 }
