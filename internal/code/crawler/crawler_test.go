@@ -498,6 +498,8 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 	}
 }
 
+// В данном тесте заменим у http клиента с помощью метода Transport, DefaultTransport который имплементирует
+// интерфейс RoundTripper, на кастомный transport, который будет возвращать заранее подготовленные данные.
 func TestDoRequestWithRetries_WithError(t *testing.T) {
 	t.Parallel()
 
@@ -555,7 +557,7 @@ func TestDoRequestWithRetries_WithError(t *testing.T) {
 				{0, &net.OpError{
 					Err: &os.SyscallError{
 						Syscall: "connect",
-						Err:     syscall.ENETUNREACH,
+						Err:     syscall.ECONNREFUSED,
 					},
 				}},
 				{0, &net.OpError{
@@ -644,6 +646,7 @@ func TestDoRequestWithRetries_WithError(t *testing.T) {
 
 type roundTripperFunc func(r *http.Request) (*http.Response, error)
 
+// создадим метод, чтобы реализовать type RoundTripper interface
 func (rf roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rf(req)
 }

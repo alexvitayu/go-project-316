@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -51,6 +52,7 @@ type Page struct {
 	Error        string        `json:"error"`
 	Seo          *Seo          `json:"seo"`
 	BrokenLinks  []BrokenLinks `json:"broken_links"`
+	Assets       []Assets      `json:"assets"`
 	DiscoveredAt time.Time     `json:"discovered_at,omitempty"`
 }
 
@@ -68,6 +70,14 @@ type Seo struct {
 	HasH1          bool   `json:"has_h1"`
 }
 
+type Assets struct {
+	URL        string `json:"url"`
+	Type       string `json:"type"`
+	StatusCode int    `json:"status_code"`
+	SizeBytes  int64  `json:"size_bytes"`
+	Error      string `json:"error"`
+}
+
 type Response struct {
 	RootURL     string    `json:"root_url"`
 	Depth       int       `json:"depth"`
@@ -78,6 +88,44 @@ type Response struct {
 type AliveInnerLink struct {
 	URL       string
 	LinkDepth int
+}
+
+// AssetsCache здесь реализуем кэш ассетов
+type AssetsCache struct {
+	cache map[string]Assets
+	mu    *sync.Mutex
+}
+
+func NewCacheAssets() *AssetsCache {
+	return &AssetsCache{
+		cache: make(map[string]Assets),
+		mu:    &sync.Mutex{},
+	}
+}
+
+func (c *AssetsCache) AddToCache(url string, assets Assets) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.cache[url]; !exists {
+		c.cache[url] = assets
+	}
+}
+
+func (c *AssetsCache) IsThereInCache(url string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.cache[url]
+	return ok
+}
+
+func (c *AssetsCache) TakeFromCache(url string) Assets {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	asset, exists := c.cache[url]
+	if exists {
+		return asset
+	}
+	return Assets{}
 }
 
 type Visits struct {
@@ -120,7 +168,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	// инициализируем структуру, которая собирает посещения и контроллирует конкурентный доступ к данным
 	visits := NewVisits()
 
-	// инициализируем каналы для очереди адресов, ошибок, обработанных страниц
+	// инициализируем каналы для очереди адресов, ошибок, обработанных страниц и сигнальный канал done вместо wg
 	queueCh := make(chan AliveInnerLink, initQueueCapacity)
 	errsCh := make(chan error, opts.Concurrency*2)
 	pagesCh := make(chan Page, 100)
@@ -136,9 +184,12 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		LinkDepth: 0,
 	}
 
+	// инициализируем AssetsCache, чтобы передать его каждому воркеру
+	cache := NewCacheAssets()
+
 	for i := 1; i <= opts.Concurrency; i++ {
 		go func(indx int) {
-			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits, limiter)
+			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits, limiter, cache)
 		}(i)
 	}
 
@@ -220,7 +271,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 }
 
 func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
-	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits, limiter *rate.Limiter) {
+	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits, limiter *rate.Limiter, cache *AssetsCache) {
 	slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
 
 	defer func() {
@@ -317,12 +368,20 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
+		assets, err := CollectAssets(ctx, opts, item.URL, bytes.NewReader(savedBody), cache)
+		if err != nil {
+			page.Error = err.Error()
+			errsCh <- fmt.Errorf("CollectAssets: %w", err)
+			continue
+		}
+
 		page.URL = item.URL
 		page.Depth = item.LinkDepth
 		page.HTTPStatus = resp.StatusCode
 		page.Status = resp.Status
 		page.Seo = seo
 		page.BrokenLinks = brLinks
+		page.Assets = assets
 		page.DiscoveredAt = time.Now()
 
 		pagesCh <- page
@@ -624,3 +683,279 @@ func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, erro
 	}
 	return resp, err
 }
+
+func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Reader, cache *AssetsCache) ([]Assets, error) {
+	var assets []Assets
+
+	doc, err := goquery.NewDocumentFromReader(body)
+	if err != nil {
+		return nil, fmt.Errorf("goquery: %w", err)
+	}
+	images := findAssets(ctx, baseURL, opts, doc, cache, "img")
+	assets = append(assets, images...)
+
+	scripts := findAssets(ctx, baseURL, opts, doc, cache, "script[src]")
+	assets = append(assets, scripts...)
+
+	styles := findAssets(ctx, baseURL, opts, doc, cache, "link[rel='stylesheet']")
+	assets = append(assets, styles...)
+
+	return assets, nil
+}
+
+func findAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document, cache *AssetsCache, asset string) []Assets {
+	var assets []Assets
+	seen := make(map[string]bool)
+
+	attrName := func(assetType string) string {
+		switch assetType {
+		case "img", "script[src]":
+			return "src"
+		case "link[rel='stylesheet']":
+			return "href"
+		default:
+			return ""
+		}
+	}(asset)
+
+	doc.Find(asset).Each(func(i int, s *goquery.Selection) {
+		if attrVal, exists := s.Attr(attrName); exists && attrVal != "" {
+			u, err := resolveUrl(baseURL, attrVal)
+			if err != nil {
+				slog.Error(fmt.Sprintf("failed to resolve %s URL", asset),
+					"src", attrVal,
+					"error", err)
+				return
+			}
+
+			if seen[u] {
+				return
+			}
+			seen[u] = true
+
+			if cache.IsThereInCache(u) {
+				assets = append(assets, cache.TakeFromCache(u))
+				return
+			}
+
+			resp, err := makeGetRequest(ctx, u, opts)
+			if err != nil {
+				asset := Assets{
+					URL:   u,
+					Type:  asset,
+					Error: err.Error(),
+				}
+				assets = append(assets, asset)
+				cache.AddToCache(u, asset)
+				return
+			}
+
+			size, err := findOutContentLength(resp)
+			if err != nil {
+				slog.Debug(fmt.Sprintf("could not determine %s size", asset),
+					"url", u,
+					"error", err)
+			}
+
+			if resp.Body != nil {
+				resp.Body.Close()
+			}
+
+			asset := Assets{
+				URL:        u,
+				Type:       determineAsset(asset),
+				StatusCode: resp.StatusCode,
+				SizeBytes:  size,
+			}
+			assets = append(assets)
+			cache.AddToCache(u, asset)
+		}
+	})
+	return assets
+}
+
+func findOutContentLength(resp *http.Response) (int64, error) {
+	if resp.Body == nil {
+		return 0, errors.New("response body is nil")
+	}
+
+	if resp.ContentLength > 0 {
+		return resp.ContentLength, nil
+	}
+
+	if resp.ContentLength == -1 {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read body: %w", err)
+		}
+		size := int64(len(body))
+		return size, nil
+	}
+	return 0, nil
+}
+
+func determineAsset(asset string) string {
+	switch asset {
+	case "img":
+		return "image"
+	case "script[src]":
+		return "script"
+	case "link[rel='stylesheet']":
+		return "style"
+	}
+	return ""
+}
+
+//func findImageAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
+//	var images []Assets
+//	seen := make(map[string]bool)
+//
+//	doc.Find("img").Each(func(i int, s *goquery.Selection) {
+//		if src, exists := s.Attr("src"); exists && src != "" {
+//			u, err := resolveUrl(baseURL, src)
+//			if err != nil {
+//				slog.Error("failed to resolve image URL",
+//					"src", src,
+//					"error", err)
+//				return
+//			}
+//
+//			if seen[u] {
+//				return
+//			}
+//			seen[u] = true
+//
+//			resp, err := makeGetRequest(ctx, u, opts)
+//			if err != nil {
+//				images = append(images, Assets{
+//					URL:   u,
+//					Type:  "image",
+//					Error: err.Error(),
+//				})
+//				return
+//			}
+//
+//			size, err := findOutContentLength(resp)
+//			if err != nil {
+//				slog.Debug("could not determine image size",
+//					"url", u,
+//					"error", err)
+//			}
+//
+//			if resp.Body != nil {
+//				resp.Body.Close()
+//			}
+//
+//			images = append(images, Assets{
+//				URL:        u,
+//				Type:       "image",
+//				StatusCode: resp.StatusCode,
+//				SizeBytes:  size,
+//			})
+//		}
+//	})
+//	return images
+//}
+
+//
+//func findScriptsAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
+//	var scripts []Assets
+//	seen := make(map[string]bool)
+//
+//	// Теги <script src="...">
+//	doc.Find("script[src]").Each(func(i int, s *goquery.Selection) {
+//		if src, exists := s.Attr("src"); exists && src != "" {
+//			u, err := resolveUrl(baseURL, src)
+//			if err != nil {
+//				slog.Error("failed to resolve script[src] URL",
+//					"src", src,
+//					"error", err)
+//				return
+//			}
+//			if seen[u] {
+//				return
+//			}
+//			seen[u] = true
+//
+//			resp, err := makeGetRequest(ctx, u, opts)
+//			if err != nil {
+//				scripts = append(scripts, Assets{
+//					URL:   u,
+//					Type:  "script",
+//					Error: err.Error(),
+//				})
+//				return
+//			}
+//
+//			size, err := findOutContentLength(resp)
+//			if err != nil {
+//				slog.Debug("could not determine script size",
+//					"url", u,
+//					"error", err)
+//			}
+//
+//			if resp.Body != nil {
+//				resp.Body.Close()
+//			}
+//
+//			scripts = append(scripts, Assets{
+//				URL:        u,
+//				Type:       "script",
+//				StatusCode: resp.StatusCode,
+//				SizeBytes:  size,
+//			})
+//		}
+//	})
+//	return scripts
+//}
+//
+//func findStyleAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
+//	var styles []Assets
+//	seen := make(map[string]bool)
+//
+//	// Теги <script src="...">
+//	doc.Find("link[rel='stylesheet']").Each(func(i int, s *goquery.Selection) {
+//		if href, exists := s.Attr("href"); exists && href != "" {
+//			u, err := resolveUrl(baseURL, href)
+//			if err != nil {
+//				slog.Error("failed to resolve style URL",
+//					"src", u,
+//					"error", err)
+//				return
+//			}
+//			if seen[u] {
+//				return
+//			}
+//			seen[u] = true
+//
+//			resp, err := makeGetRequest(ctx, u, opts)
+//			if err != nil {
+//				styles = append(styles, Assets{
+//					URL:   u,
+//					Type:  "style",
+//					Error: err.Error(),
+//				})
+//				return
+//			}
+//
+//			size, err := findOutContentLength(resp)
+//			if err != nil {
+//				slog.Debug("could not determine style size",
+//					"url", u,
+//					"error", err)
+//			}
+//
+//			if resp.Body != nil {
+//				resp.Body.Close()
+//			}
+//
+//			styles = append(styles, Assets{
+//				URL:        u,
+//				Type:       "style",
+//				StatusCode: resp.StatusCode,
+//				SizeBytes:  size,
+//			})
+//		}
+//	})
+//	return styles
+//}
