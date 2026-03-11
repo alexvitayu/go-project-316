@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -649,4 +650,63 @@ type roundTripperFunc func(r *http.Request) (*http.Response, error)
 // создадим метод, чтобы реализовать type RoundTripper interface
 func (rf roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rf(req)
+}
+
+type RoundTripCounter struct {
+	count int32
+}
+
+func (rtc *RoundTripCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	rtc.count++
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Тест дублирования ассетов</title>
+</head>
+<body>
+<h1>Тестовая страница с дублирующимся ассетом</h1>
+
+<!-- Один и тот же ассет используется дважды -->
+<img src="/images/test-image.jpg" alt="Тестовое изображение 1">
+<img src="/images/test-image.jpg" alt="Тестовое изображение 2">
+
+<p>На этой странице одно и то же изображение используется дважды.</p>
+</body>
+</html>`)),
+
+		Header:  http.Header{"Content-Type": []string{"text/html"}},
+		Request: req,
+	}, nil
+}
+
+func TestCollectAssets(t *testing.T) {
+	t.Parallel()
+
+	cache := crawler.NewCacheAssets()
+
+	testTransport := &RoundTripCounter{}
+
+	opts := crawler.Options{
+		HTTPClient: &http.Client{
+			Transport: testTransport,
+		},
+	}
+
+	req, err := http.NewRequest("GET", "http://example.com", nil)
+	require.NoError(t, err)
+
+	resp, err := opts.HTTPClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	_, err = crawler.CollectAssets(t.Context(), opts, "http://example.com", resp.Body, cache)
+	require.NoError(t, err)
+
+	require.Equal(t, int32(2), testTransport.count)
+
+	exists := cache.IsThereInCache("http://example.com/images/test-image.jpg")
+	require.True(t, exists)
+	require.Equal(t, "image", cache.TakeFromCache("http://example.com/images/test-image.jpg").Type)
 }

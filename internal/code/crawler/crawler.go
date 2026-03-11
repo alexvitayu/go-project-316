@@ -703,7 +703,8 @@ func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Re
 	return assets, nil
 }
 
-func findAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document, cache *AssetsCache, asset string) []Assets {
+func findAssets(ctx context.Context, baseURL string, opts Options,
+	doc *goquery.Document, cache *AssetsCache, asset string) []Assets {
 	var assets []Assets
 	seen := make(map[string]bool)
 
@@ -767,7 +768,7 @@ func findAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.
 				StatusCode: resp.StatusCode,
 				SizeBytes:  size,
 			}
-			assets = append(assets)
+			assets = append(assets, asset)
 			cache.AddToCache(u, asset)
 		}
 	})
@@ -805,157 +806,3 @@ func determineAsset(asset string) string {
 	}
 	return ""
 }
-
-//func findImageAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
-//	var images []Assets
-//	seen := make(map[string]bool)
-//
-//	doc.Find("img").Each(func(i int, s *goquery.Selection) {
-//		if src, exists := s.Attr("src"); exists && src != "" {
-//			u, err := resolveUrl(baseURL, src)
-//			if err != nil {
-//				slog.Error("failed to resolve image URL",
-//					"src", src,
-//					"error", err)
-//				return
-//			}
-//
-//			if seen[u] {
-//				return
-//			}
-//			seen[u] = true
-//
-//			resp, err := makeGetRequest(ctx, u, opts)
-//			if err != nil {
-//				images = append(images, Assets{
-//					URL:   u,
-//					Type:  "image",
-//					Error: err.Error(),
-//				})
-//				return
-//			}
-//
-//			size, err := findOutContentLength(resp)
-//			if err != nil {
-//				slog.Debug("could not determine image size",
-//					"url", u,
-//					"error", err)
-//			}
-//
-//			if resp.Body != nil {
-//				resp.Body.Close()
-//			}
-//
-//			images = append(images, Assets{
-//				URL:        u,
-//				Type:       "image",
-//				StatusCode: resp.StatusCode,
-//				SizeBytes:  size,
-//			})
-//		}
-//	})
-//	return images
-//}
-
-//
-//func findScriptsAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
-//	var scripts []Assets
-//	seen := make(map[string]bool)
-//
-//	// Теги <script src="...">
-//	doc.Find("script[src]").Each(func(i int, s *goquery.Selection) {
-//		if src, exists := s.Attr("src"); exists && src != "" {
-//			u, err := resolveUrl(baseURL, src)
-//			if err != nil {
-//				slog.Error("failed to resolve script[src] URL",
-//					"src", src,
-//					"error", err)
-//				return
-//			}
-//			if seen[u] {
-//				return
-//			}
-//			seen[u] = true
-//
-//			resp, err := makeGetRequest(ctx, u, opts)
-//			if err != nil {
-//				scripts = append(scripts, Assets{
-//					URL:   u,
-//					Type:  "script",
-//					Error: err.Error(),
-//				})
-//				return
-//			}
-//
-//			size, err := findOutContentLength(resp)
-//			if err != nil {
-//				slog.Debug("could not determine script size",
-//					"url", u,
-//					"error", err)
-//			}
-//
-//			if resp.Body != nil {
-//				resp.Body.Close()
-//			}
-//
-//			scripts = append(scripts, Assets{
-//				URL:        u,
-//				Type:       "script",
-//				StatusCode: resp.StatusCode,
-//				SizeBytes:  size,
-//			})
-//		}
-//	})
-//	return scripts
-//}
-//
-//func findStyleAssets(ctx context.Context, baseURL string, opts Options, doc *goquery.Document) []Assets {
-//	var styles []Assets
-//	seen := make(map[string]bool)
-//
-//	// Теги <script src="...">
-//	doc.Find("link[rel='stylesheet']").Each(func(i int, s *goquery.Selection) {
-//		if href, exists := s.Attr("href"); exists && href != "" {
-//			u, err := resolveUrl(baseURL, href)
-//			if err != nil {
-//				slog.Error("failed to resolve style URL",
-//					"src", u,
-//					"error", err)
-//				return
-//			}
-//			if seen[u] {
-//				return
-//			}
-//			seen[u] = true
-//
-//			resp, err := makeGetRequest(ctx, u, opts)
-//			if err != nil {
-//				styles = append(styles, Assets{
-//					URL:   u,
-//					Type:  "style",
-//					Error: err.Error(),
-//				})
-//				return
-//			}
-//
-//			size, err := findOutContentLength(resp)
-//			if err != nil {
-//				slog.Debug("could not determine style size",
-//					"url", u,
-//					"error", err)
-//			}
-//
-//			if resp.Body != nil {
-//				resp.Body.Close()
-//			}
-//
-//			styles = append(styles, Assets{
-//				URL:        u,
-//				Type:       "style",
-//				StatusCode: resp.StatusCode,
-//				SizeBytes:  size,
-//			})
-//		}
-//	})
-//	return styles
-//}
