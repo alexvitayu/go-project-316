@@ -18,7 +18,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.25.7'
+          go-version: '1.25.4'
           cache: false # отключаем встроенное кэширование и будем использовать actions/cache@v4
 
       - name: Cache Go modules

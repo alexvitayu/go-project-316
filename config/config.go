@@ -26,9 +26,6 @@ type DefaultOps struct {
 
 func LoadCfg() (*AppConfig, error) {
 	env := os.Getenv("APP_ENV")
-	if env == "" {
-		env = "development"
-	}
 
 	// Загружаем env файл для конкретной среды
 	if env == "development" {
@@ -39,10 +36,22 @@ func LoadCfg() (*AppConfig, error) {
 		}
 	}
 
+	defaults := map[string]string{
+		"DEPTH":   "2",
+		"RETRIES": "1",
+		"DELAY":   "0ms",
+		"TIMEOUT": "30s",
+		"RPS":     "0",
+		"WORKERS": "2",
+	}
+
 	intEnv := []string{"DEPTH", "RETRIES", "RPS", "WORKERS"}
 	ds := make([]int, len(intEnv))
 	for i, v := range intEnv {
 		str := os.Getenv(v)
+		if str == "" {
+			str = defaults[v]
+		}
 		d, err := strconv.Atoi(str)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert string to int: %w", err)
@@ -55,6 +64,9 @@ func LoadCfg() (*AppConfig, error) {
 	ts := make([]time.Duration, len(timeEnv))
 	for i, t := range timeEnv {
 		str := os.Getenv(t)
+		if str == "" {
+			str = defaults[t]
+		}
 		duration, err := time.ParseDuration(str)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert string to time.Duration: %w", err)

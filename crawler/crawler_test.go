@@ -2,7 +2,7 @@ package crawler_test
 
 import (
 	"bytes"
-	"code/internal/code/crawler"
+	"code/crawler"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -30,7 +30,7 @@ func TestAnalyze(t *testing.T) {
 		name         string
 		handler      http.HandlerFunc
 		options      func(server *httptest.Server) crawler.Options
-		wantResponse crawler.Response
+		wantResponse crawler.Report
 		wantErr      error
 		thereIsErr   bool
 	}{
@@ -39,7 +39,7 @@ func TestAnalyze(t *testing.T) {
 			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				response := crawler.Response{
+				response := crawler.Report{
 					RootURL: r.Host, //или server.URL
 					Pages: []crawler.Page{
 						{
@@ -61,7 +61,7 @@ func TestAnalyze(t *testing.T) {
 					Concurrency: 2,
 				}
 			},
-			wantResponse: crawler.Response{
+			wantResponse: crawler.Report{
 				Pages: []crawler.Page{
 					{
 						HTTPStatus: http.StatusOK,
@@ -78,7 +78,7 @@ func TestAnalyze(t *testing.T) {
 			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusNotFound)
 				w.Header().Set("Content-Type", "application/json")
-				response := crawler.Response{
+				response := crawler.Report{
 					RootURL: r.Host, //или server.URL
 					Pages: []crawler.Page{
 						{
@@ -100,7 +100,7 @@ func TestAnalyze(t *testing.T) {
 					Concurrency: 1,
 				}
 			},
-			wantResponse: crawler.Response{
+			wantResponse: crawler.Report{
 				Pages: []crawler.Page{
 					{
 						HTTPStatus: http.StatusNotFound,
@@ -117,7 +117,7 @@ func TestAnalyze(t *testing.T) {
 			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(700)
 				w.Header().Set("Content-Type", "application/json")
-				response := crawler.Response{
+				response := crawler.Report{
 					RootURL: r.Host, //или server.URL
 					Pages: []crawler.Page{
 						{
@@ -138,7 +138,7 @@ func TestAnalyze(t *testing.T) {
 					Concurrency: 4,
 				}
 			},
-			wantResponse: crawler.Response{
+			wantResponse: crawler.Report{
 				Pages: []crawler.Page{
 					{
 						HTTPStatus: 700,
@@ -198,7 +198,7 @@ func TestAnalyze(t *testing.T) {
 			}
 			require.NoError(t, err)
 
-			var response crawler.Response
+			var response crawler.Report
 			jErr := json.Unmarshal(got, &response)
 			require.NoError(t, jErr)
 
@@ -238,14 +238,14 @@ func TestCollectSEO(t *testing.T) {
 	var testCases = []struct {
 		name    string
 		handler http.Handler
-		wantSEO *crawler.Seo
+		wantSEO *crawler.SEO
 	}{
 		{
 			name: "seo_positive_test",
 			handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/seo_test/positive_test.html")
+				http.ServeFile(writer, request, "./../testdata/seo_test/positive_test.html")
 			}),
-			wantSEO: &crawler.Seo{
+			wantSEO: &crawler.SEO{
 				HasTitle:       true,
 				Title:          "My first site",
 				HasDescription: true,
@@ -256,9 +256,9 @@ func TestCollectSEO(t *testing.T) {
 		{
 			name: "seo_negative_test",
 			handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				http.ServeFile(writer, request, "/home/alex/go-project-316/testdata/seo_test/negative_test.html")
+				http.ServeFile(writer, request, "./../testdata/seo_test/negative_test.html")
 			}),
-			wantSEO: &crawler.Seo{
+			wantSEO: &crawler.SEO{
 				HasTitle:       false,
 				Title:          "",
 				HasDescription: false,
@@ -375,7 +375,7 @@ func TestLimiter_TimeBetweenRequests(t *testing.T) {
 
 			start := time.Now()
 
-			for w := 0; w < tc.workers; w++ {
+			for w := range tc.workers {
 				wg.Add(1)
 				go func(workerID int) {
 					defer wg.Done()
@@ -436,7 +436,7 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 				HTTPClient: &http.Client{},
 			},
 			handler: func(counter *int) http.HandlerFunc {
-				return func(w http.ResponseWriter, r *http.Request) {
+				return func(w http.ResponseWriter, _ *http.Request) {
 					(*counter)++ // увеличиваем счетчик
 
 					if *counter <= 2 {
@@ -459,7 +459,7 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 				HTTPClient: &http.Client{},
 			},
 			handler: func(counter *int) http.HandlerFunc {
-				return func(w http.ResponseWriter, r *http.Request) {
+				return func(w http.ResponseWriter, _ *http.Request) {
 					(*counter)++ // увеличиваем счетчик
 
 					if *counter <= 3 {
@@ -771,7 +771,6 @@ func TestFindAssets(t *testing.T) {
 		SizeBytes:  0,
 		Error:      "404 Not Found",
 	}
-	
 	opts := crawler.Options{
 		HTTPClient: &http.Client{},
 	}

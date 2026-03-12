@@ -1,6 +1,6 @@
 module code
 
-go 1.25.7
+go 1.25.4
 
 require (
 	github.com/PuerkitoBio/goquery v1.11.0

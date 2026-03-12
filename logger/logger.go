@@ -1,7 +1,7 @@
 package logger
 
 import (
-	"code/internal/config"
+	"code/config"
 	"log/slog"
 	"os"
 	"strings"
@@ -13,23 +13,23 @@ import (
 func SetupLogger(cfg *config.AppConfig) *slog.Logger {
 	var level slog.Leveler
 	var addSource bool
-	var noColor bool
+	var out *os.File
+
 	if cfg.APPEnv == "development" {
 		level = slog.LevelDebug
 		addSource = true
-		noColor = false
+		out = os.Stdout
 	} else {
 		level = slog.LevelInfo
 		addSource = false
-		noColor = true
+		out = os.Stderr
 	}
 
-	handler := tint.NewHandler(os.Stdout, &tint.Options{
+	handler := tint.NewHandler(out, &tint.Options{
 		AddSource:  addSource,
 		Level:      level,
 		TimeFormat: time.RFC1123,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			_ = groups
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.LevelKey {
 				// Преобразуем уровень в верхний регистр
 				l := a.Value.String()
@@ -37,8 +37,9 @@ func SetupLogger(cfg *config.AppConfig) *slog.Logger {
 			}
 			return a
 		},
-		NoColor: noColor,
+		NoColor: true,
 	})
+
 	logger := slog.New(handler)
 	return logger
 }

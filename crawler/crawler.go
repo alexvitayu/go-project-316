@@ -39,7 +39,7 @@ type Options struct {
 	Timeout     time.Duration
 	UserAgent   string
 	Concurrency int
-	IndentJSON  string
+	IndentJSON  bool
 	HTTPClient  *http.Client
 	RPS         int
 }
@@ -50,7 +50,7 @@ type Page struct {
 	HTTPStatus   int           `json:"http_status"`
 	Status       string        `json:"status"`
 	Error        string        `json:"error"`
-	Seo          *Seo          `json:"seo"`
+	SEO          *SEO          `json:"seo"`
 	BrokenLinks  []BrokenLinks `json:"broken_links"`
 	Assets       []Assets      `json:"assets"`
 	DiscoveredAt string        `json:"discovered_at"`
@@ -62,7 +62,7 @@ type BrokenLinks struct {
 	Err        string `json:"error"`
 }
 
-type Seo struct {
+type SEO struct {
 	HasTitle       bool   `json:"has_title"`
 	Title          string `json:"title"`
 	HasDescription bool   `json:"has_description"`
@@ -78,7 +78,7 @@ type Assets struct {
 	Error      string `json:"error"`
 }
 
-type Response struct {
+type Report struct {
 	RootURL     string `json:"root_url"`
 	Depth       int    `json:"depth"`
 	GeneratedAt string `json:"generated_at"`
@@ -146,8 +146,6 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(c, opts.Timeout)
 	defer cancel()
 
-	fmt.Printf("приняли индент = %s\n", opts.IndentJSON)
-
 	// Обработка Ctrl + C
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -214,7 +212,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 
 			case <-time.After(100 * time.Millisecond): // опрос через каждые 100 миллисекунд, чтобы не грузить процессор
 				if atomic.LoadInt32(&pendingURLs) == 0 {
-					slog.Info("all URLs processed, shutting down")
+					slog.Debug("all URLs processed, shutting down")
 					close(queueCh)
 					// Ждём завершения воркеров
 					for range opts.Concurrency {
@@ -257,7 +255,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		firstErr = errs[0]
 	}
 
-	data := Response{
+	data := Report{
 		RootURL:     opts.URL,
 		Depth:       opts.Depth,
 		GeneratedAt: time.Now().Format(time.RFC3339),
@@ -267,13 +265,13 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	return ReturnReport(&data, opts.IndentJSON, firstErr)
 }
 
-func ReturnReport(data *Response, indent string, firstError error) ([]byte, error) {
+func ReturnReport(data *Report, indent bool, firstError error) ([]byte, error) {
 	var (
 		report []byte
 		err    error
 	)
 
-	if indent == "true" {
+	if indent {
 		report, err = json.MarshalIndent(data, "", " ")
 	} else {
 		report, err = json.Marshal(data)
@@ -396,7 +394,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		page.Depth = item.LinkDepth
 		page.HTTPStatus = resp.StatusCode
 		page.Status = resp.Status
-		page.Seo = seo
+		page.SEO = seo
 		page.BrokenLinks = brLinks
 		page.Assets = assets
 		page.DiscoveredAt = time.Now().Format(time.RFC3339)
@@ -410,8 +408,11 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 func checkHTML(r io.Reader) []string {
 	var links []string
 
-	doc, _ := html.Parse(r)
-	//err TODO
+	doc, err := html.Parse(r)
+	if err != nil {
+		slog.Error("checkHTML", "parse html failed", err)
+		return nil
+	}
 
 	for n := range doc.Descendants() { // итерируемся по потомкам descendants
 		if n.Type == html.ElementNode && n.DataAtom == atom.A { // atom.A это то же самое, что и тег <a> (ссылка)
@@ -521,12 +522,12 @@ func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Respon
 	return getResp, nil
 }
 
-func CollectSEO(body io.Reader) (*Seo, error) {
-	var seo Seo
+func CollectSEO(body io.Reader) (*SEO, error) {
+	var seo SEO
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
-		return &Seo{}, fmt.Errorf("goquery: %w", err)
+		return &SEO{}, fmt.Errorf("goquery: %w", err)
 	}
 
 	title := doc.Find("title").Text()
@@ -558,7 +559,7 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 		}
 		abs, err := resolveUrl(opts.URL, l) // преобразуем URLs в абсолютные
 		if err != nil {
-			slog.Warn("failed to resolve URL %s: %v\n", l, err)
+			slog.Warn("failed to resolve URL", "link", l, "error", err)
 			continue
 		}
 		if abs == "" || !isValidURL(abs) {
@@ -736,11 +737,11 @@ func FindAssets(ctx context.Context, baseURL string, opts Options,
 		}
 	}(asset)
 
-	doc.Find(asset).Each(func(i int, s *goquery.Selection) {
+	doc.Find(asset).Each(func(_ int, s *goquery.Selection) {
 		if attrVal, exists := s.Attr(attrName); exists && attrVal != "" {
 			u, err := resolveUrl(baseURL, attrVal)
 			if err != nil {
-				slog.Error(fmt.Sprintf("failed to resolve %s URL", asset),
+				slog.Error("failed to resolve %s URL",
 					"src", attrVal,
 					"error", err)
 				return
@@ -782,7 +783,7 @@ func FindAssets(ctx context.Context, baseURL string, opts Options,
 
 			size, err := FindOutContentLength(resp)
 			if err != nil {
-				slog.Debug(fmt.Sprintf("could not determine %s size", asset),
+				slog.Debug("could not determine %s size",
 					"url", u,
 					"error", err)
 			}

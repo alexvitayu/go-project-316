@@ -1,12 +1,10 @@
 package main
 
 import (
-	"code/internal/code/crawler"
-	"code/internal/config"
-	"code/internal/logger"
+	"code/config"
+	"code/crawler"
+	"code/logger"
 	"context"
-	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,13 +19,12 @@ func main() {
 	cfg, err := config.LoadCfg()
 	if err != nil {
 		slog.Error("LoadConfig", "error", err)
+		os.Exit(1)
 	}
 
 	customLogger := logger.SetupLogger(cfg)
 	slog.SetDefault(customLogger)
-
-	slog.Info("Application started")
-	slog.Debug(fmt.Sprintf("APP_ENV=%s", cfg.APPEnv))
+	slog.Debug("APP_ENV", "app_env", cfg.APPEnv)
 
 	cmd := &cli.Command{
 
@@ -73,9 +70,9 @@ func main() {
 				Name:  "workers",
 				Value: cfg.DefaultOps.Workers,
 				Usage: "number of concurrent workers"},
-			&cli.StringFlag{
+			&cli.BoolFlag{
 				Name:  "indent-json",
-				Value: "",
+				Value: false,
 				Usage: "sets suitable for reading format"},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -90,7 +87,7 @@ func main() {
 			rps := cmd.Int("rps")
 			agent := cmd.String("user-agent")
 			workers := cmd.Int("workers")
-			indent := cmd.String("indent-json")
+			indent := cmd.Bool("indent-json")
 
 			client := http.Client{
 				Timeout: 5 * time.Second,
@@ -111,10 +108,11 @@ func main() {
 
 			report, err := crawler.Analyze(ctx, options)
 			if err != nil {
-				fmt.Println(err) //TODO
+				slog.Error("crawler failed", "error", err)
+				return err
 			}
 
-			fmt.Println(string(report))
+			os.Stdout.Write(report)
 			return nil
 		},
 	}
@@ -122,6 +120,6 @@ func main() {
 	config.Substitute()
 
 	if err := cmd.Run(ctx, os.Args); err != nil {
-		log.Fatal(err) //TODO
+		os.Exit(1)
 	}
 }

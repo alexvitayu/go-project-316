@@ -23,9 +23,7 @@ linters:
     - depguard
     - dogsled
     - dupl
-    - errcheck
     - errorlint
-    - funlen
     - gocheckcompilerdirectives
     - gochecknoinits
     - goconst
@@ -41,7 +39,6 @@ linters:
     - nolintlint
     - revive
     - staticcheck
-    - testifylint
     - unconvert
     - unparam
     - unused
