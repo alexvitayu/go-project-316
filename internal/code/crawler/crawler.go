@@ -691,19 +691,19 @@ func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Re
 	if err != nil {
 		return nil, fmt.Errorf("goquery: %w", err)
 	}
-	images := findAssets(ctx, baseURL, opts, doc, cache, "img")
+	images := FindAssets(ctx, baseURL, opts, doc, cache, "img")
 	assets = append(assets, images...)
 
-	scripts := findAssets(ctx, baseURL, opts, doc, cache, "script[src]")
+	scripts := FindAssets(ctx, baseURL, opts, doc, cache, "script[src]")
 	assets = append(assets, scripts...)
 
-	styles := findAssets(ctx, baseURL, opts, doc, cache, "link[rel='stylesheet']")
+	styles := FindAssets(ctx, baseURL, opts, doc, cache, "link[rel='stylesheet']")
 	assets = append(assets, styles...)
 
 	return assets, nil
 }
 
-func findAssets(ctx context.Context, baseURL string, opts Options,
+func FindAssets(ctx context.Context, baseURL string, opts Options,
 	doc *goquery.Document, cache *AssetsCache, asset string) []Assets {
 	var assets []Assets
 	seen := make(map[string]bool)
@@ -743,7 +743,7 @@ func findAssets(ctx context.Context, baseURL string, opts Options,
 			if err != nil {
 				asset := Assets{
 					URL:   u,
-					Type:  asset,
+					Type:  determineAsset(asset),
 					Error: err.Error(),
 				}
 				assets = append(assets, asset)
@@ -751,7 +751,19 @@ func findAssets(ctx context.Context, baseURL string, opts Options,
 				return
 			}
 
-			size, err := findOutContentLength(resp)
+			if resp.StatusCode >= 400 {
+				asset := Assets{
+					URL:        u,
+					Type:       determineAsset(asset),
+					StatusCode: resp.StatusCode,
+					Error:      resp.Status,
+				}
+				assets = append(assets, asset)
+				cache.AddToCache(u, asset)
+				return
+			}
+
+			size, err := FindOutContentLength(resp)
 			if err != nil {
 				slog.Debug(fmt.Sprintf("could not determine %s size", asset),
 					"url", u,
@@ -775,7 +787,7 @@ func findAssets(ctx context.Context, baseURL string, opts Options,
 	return assets
 }
 
-func findOutContentLength(resp *http.Response) (int64, error) {
+func FindOutContentLength(resp *http.Response) (int64, error) {
 	if resp.Body == nil {
 		return 0, errors.New("response body is nil")
 	}

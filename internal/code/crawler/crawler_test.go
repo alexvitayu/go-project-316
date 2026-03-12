@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
@@ -681,7 +682,7 @@ func (rtc *RoundTripCounter) RoundTrip(req *http.Request) (*http.Response, error
 	}, nil
 }
 
-func TestCollectAssets(t *testing.T) {
+func TestCollectAssets_RepeatedAssets(t *testing.T) {
 	t.Parallel()
 
 	cache := crawler.NewCacheAssets()
@@ -709,4 +710,78 @@ func TestCollectAssets(t *testing.T) {
 	exists := cache.IsThereInCache("http://example.com/images/test-image.jpg")
 	require.True(t, exists)
 	require.Equal(t, "image", cache.TakeFromCache("http://example.com/images/test-image.jpg").Type)
+}
+
+func TestFindOutContentLength(t *testing.T) {
+	t.Parallel()
+
+	var tt = []struct {
+		name       string
+		resp       *http.Response
+		wantLength int64
+		isThereErr bool
+		err        string
+	}{
+		{name: "error_body_is_nil",
+			resp:       &http.Response{},
+			isThereErr: true,
+			err:        "response body is nil",
+		},
+		{name: "positive_content_length",
+			resp: &http.Response{
+				ContentLength: 777,
+				Body:          io.NopCloser(strings.NewReader("content_length_is_777")),
+			},
+			wantLength: int64(777),
+			isThereErr: false,
+		},
+		{name: "content_length_is_-1",
+			resp: &http.Response{
+				ContentLength: -1,
+				Body:          io.NopCloser(strings.NewReader("content_length_is_20")),
+			},
+			wantLength: int64(20),
+			isThereErr: false,
+		},
+	}
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			size, err := crawler.FindOutContentLength(tc.resp)
+			if tc.isThereErr {
+				require.Error(t, err)
+				assert.Equal(t, tc.err, err.Error())
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantLength, size)
+			}
+		})
+	}
+}
+
+func TestFindAssets(t *testing.T) {
+	t.Parallel()
+	cache := crawler.NewCacheAssets()
+	expectedAsset := crawler.Assets{
+		URL:        "http://example.com/images/test-image.jpg",
+		Type:       "image",
+		StatusCode: 404,
+		SizeBytes:  0,
+		Error:      "404 Not Found",
+	}
+	
+	opts := crawler.Options{
+		HTTPClient: &http.Client{},
+	}
+
+	body := strings.NewReader(`<img src="/images/test-image.jpg" alt="Тестовое изображение 1">`)
+
+	doc, err := goquery.NewDocumentFromReader(body)
+	require.NoError(t, err)
+
+	assets := crawler.FindAssets(t.Context(), "http://example.com", opts, doc, cache, "img")
+
+	assert.Equal(t, expectedAsset, assets[0])
 }
