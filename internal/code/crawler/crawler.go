@@ -53,13 +53,13 @@ type Page struct {
 	Seo          *Seo          `json:"seo"`
 	BrokenLinks  []BrokenLinks `json:"broken_links"`
 	Assets       []Assets      `json:"assets"`
-	DiscoveredAt time.Time     `json:"discovered_at,omitempty"`
+	DiscoveredAt string        `json:"discovered_at"`
 }
 
 type BrokenLinks struct {
 	URL        string `json:"url"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Err        string `json:"error,omitempty"`
+	StatusCode int    `json:"status_code"`
+	Err        string `json:"error"`
 }
 
 type Seo struct {
@@ -79,10 +79,10 @@ type Assets struct {
 }
 
 type Response struct {
-	RootURL     string    `json:"root_url"`
-	Depth       int       `json:"depth"`
-	GeneratedAt time.Time `json:"generated_at"`
-	Pages       []Page    `json:"pages"`
+	RootURL     string `json:"root_url"`
+	Depth       int    `json:"depth"`
+	GeneratedAt string `json:"generated_at"`
+	Pages       []Page `json:"pages"`
 }
 
 type AliveInnerLink struct {
@@ -145,6 +145,8 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	// Обработка флага timeout
 	ctx, cancel := context.WithTimeout(c, opts.Timeout)
 	defer cancel()
+
+	fmt.Printf("приняли индент = %s\n", opts.IndentJSON)
 
 	// Обработка Ctrl + C
 	go func() {
@@ -258,16 +260,31 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	data := Response{
 		RootURL:     opts.URL,
 		Depth:       opts.Depth,
-		GeneratedAt: time.Now(),
+		GeneratedAt: time.Now().Format(time.RFC3339),
 		Pages:       pages,
 	}
 
-	report, err := json.MarshalIndent(data, "", opts.IndentJSON)
+	return ReturnReport(&data, opts.IndentJSON, firstErr)
+}
+
+func ReturnReport(data *Response, indent string, firstError error) ([]byte, error) {
+	var (
+		report []byte
+		err    error
+	)
+
+	if indent == "true" {
+		report, err = json.MarshalIndent(data, "", " ")
+	} else {
+		report, err = json.Marshal(data)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal report: %w", err)
 	}
+	report = append(report, '\n') // завершающий перевод строки
 
-	return report, firstErr
+	return report, firstError
 }
 
 func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
@@ -382,7 +399,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		page.Seo = seo
 		page.BrokenLinks = brLinks
 		page.Assets = assets
-		page.DiscoveredAt = time.Now()
+		page.DiscoveredAt = time.Now().Format(time.RFC3339)
 
 		pagesCh <- page
 

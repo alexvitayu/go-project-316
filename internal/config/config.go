@@ -92,7 +92,6 @@ func Substitute() {
 				return fmt.Sprintf("   --%s value\t%s", flag.Name, flag.Usage)
 			}
 			return fmt.Sprintf("   --%s value\t%s (default: %q)", flag.Name, flag.Usage, flag.Value)
-
 		default:
 			return fmt.Sprintf("   --%s, %s\t%s", "help", "-h", "show help")
 		}

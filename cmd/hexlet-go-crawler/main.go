@@ -73,6 +73,10 @@ func main() {
 				Name:  "workers",
 				Value: cfg.DefaultOps.Workers,
 				Usage: "number of concurrent workers"},
+			&cli.StringFlag{
+				Name:  "indent-json",
+				Value: "",
+				Usage: "sets suitable for reading format"},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
 			var url string
@@ -86,6 +90,7 @@ func main() {
 			rps := cmd.Int("rps")
 			agent := cmd.String("user-agent")
 			workers := cmd.Int("workers")
+			indent := cmd.String("indent-json")
 
 			client := http.Client{
 				Timeout: 5 * time.Second,
@@ -99,7 +104,7 @@ func main() {
 				Timeout:     timeout,
 				UserAgent:   agent,
 				Concurrency: workers,
-				IndentJSON:  "  ",
+				IndentJSON:  indent,
 				HTTPClient:  &client,
 				RPS:         rps,
 			}
@@ -110,7 +115,6 @@ func main() {
 			}
 
 			fmt.Println(string(report))
-			fmt.Println(options)
 			return nil
 		},
 	}
@@ -120,5 +124,4 @@ func main() {
 	if err := cmd.Run(ctx, os.Args); err != nil {
 		log.Fatal(err) //TODO
 	}
-	slog.Info("See you!")
 }
