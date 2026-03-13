@@ -37,12 +37,12 @@ func LoadCfg() (*AppConfig, error) {
 	}
 
 	defaults := map[string]string{
-		"DEPTH":   "2",
+		"DEPTH":   "10",
 		"RETRIES": "1",
-		"DELAY":   "0ms",
-		"TIMEOUT": "30s",
+		"DELAY":   "0s",
+		"TIMEOUT": "15s",
 		"RPS":     "0",
-		"WORKERS": "2",
+		"WORKERS": "4",
 	}
 
 	intEnv := []string{"DEPTH", "RETRIES", "RPS", "WORKERS"}

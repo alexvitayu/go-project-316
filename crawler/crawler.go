@@ -49,7 +49,7 @@ type Page struct {
 	Depth        int           `json:"depth"`
 	HTTPStatus   int           `json:"http_status"`
 	Status       string        `json:"status"`
-	Error        string        `json:"error"`
+	Error        string        `json:"error,omitempty"`
 	SEO          *SEO          `json:"seo"`
 	BrokenLinks  []BrokenLinks `json:"broken_links"`
 	Assets       []Assets      `json:"assets"`
@@ -75,7 +75,7 @@ type Assets struct {
 	Type       string `json:"type"`
 	StatusCode int    `json:"status_code"`
 	SizeBytes  int64  `json:"size_bytes"`
-	Error      string `json:"error"`
+	Error      string `json:"error,omitempty"`
 }
 
 type Report struct {
@@ -198,7 +198,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		for {
 			select {
 			case <-ctx.Done():
-				slog.Info("context done, stopping crawler", "ctx_error", ctx.Err())
+				slog.Debug("context done, stopping crawler", "ctx_error", ctx.Err())
 				// Принудительно закрываем каналы
 				close(queueCh)
 				// Ждём завершения воркеров
@@ -338,7 +338,6 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
 
 		// Выполняем запрос
-		//resp, err := opts.HTTPClient.Do(req)
 		resp, err := DoRequestWithRetries(req, opts)
 		if err != nil {
 			if resp != nil {
@@ -390,10 +389,17 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
+		var status string
+		if resp.Status == "200 OK" {
+			status = "ok"
+		} else {
+			status = resp.Status
+		}
+
 		page.URL = item.URL
 		page.Depth = item.LinkDepth
 		page.HTTPStatus = resp.StatusCode
-		page.Status = resp.Status
+		page.Status = status
 		page.SEO = seo
 		page.BrokenLinks = brLinks
 		page.Assets = assets
@@ -574,7 +580,7 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 
 func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
 	pendingURLs *int32, limiter *rate.Limiter) ([]BrokenLinks, error) {
-	var brLinks []BrokenLinks
+	brLinks := make([]BrokenLinks, 0)
 
 	for _, u := range URLs {
 		if err := limiter.Wait(ctx); err != nil {
@@ -703,11 +709,11 @@ func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, erro
 }
 
 func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Reader, cache *AssetsCache) ([]Assets, error) {
-	var assets []Assets
+	assets := make([]Assets, 0)
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
-		return nil, fmt.Errorf("goquery: %w", err)
+		return []Assets{}, fmt.Errorf("goquery: %w", err)
 	}
 	images := FindAssets(ctx, baseURL, opts, doc, cache, "img")
 	assets = append(assets, images...)

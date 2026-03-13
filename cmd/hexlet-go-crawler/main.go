@@ -108,7 +108,7 @@ func main() {
 
 			report, err := crawler.Analyze(ctx, options)
 			if err != nil {
-				slog.Error("crawler failed", "error", err)
+				//slog.Error("crawler failed", "error", err)
 				return err
 			}
 
