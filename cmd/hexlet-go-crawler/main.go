@@ -107,19 +107,16 @@ func main() {
 			}
 
 			report, err := crawler.Analyze(ctx, options)
-			if err != nil {
-				//slog.Error("crawler failed", "error", err)
-				return err
+			if len(report) > 0 {
+				os.Stdout.Write(report)
 			}
-
-			os.Stdout.Write(report)
-			return nil
+			return err
 		},
 	}
 
 	config.Substitute()
 
 	if err := cmd.Run(ctx, os.Args); err != nil {
-		os.Exit(1)
+		slog.Debug("crawler failed", "error", err)
 	}
 }

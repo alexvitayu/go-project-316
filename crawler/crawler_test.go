@@ -224,12 +224,12 @@ func TestArrangeLinks(t *testing.T) {
 		queueCh := make(chan crawler.AliveInnerLink)
 		var pendingURLs int32 = 0
 		limiter := rate.NewLimiter(rate.Inf, 1)
-
 		wantLengthBroken := 2
+		brLinks := make([]crawler.BrokenLinks, 0)
 
-		broken, err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter)
+		err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter, &brLinks)
 		require.NoError(t, err)
-		assert.Len(t, broken, wantLengthBroken)
+		assert.Len(t, brLinks, wantLengthBroken)
 	})
 }
 
@@ -664,7 +664,7 @@ func (rtc *RoundTripCounter) RoundTrip(req *http.Request) (*http.Response, error
 		Body: io.NopCloser(strings.NewReader(`<!DOCTYPE html>
 <html>
 <head>
-    <title>Тест дублирования ассетов</title>
+   <title>Тест дублирования ассетов</title>
 </head>
 <body>
 <h1>Тестовая страница с дублирующимся ассетом</h1>

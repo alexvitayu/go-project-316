@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -249,10 +250,21 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 		}
 	}
 
+	// отсортируем страницы по URL
+	normalizePages(pages)
+
 	// возвращаем первую ошибку
 	var firstErr error
 	if len(errs) > 0 {
 		firstErr = errs[0]
+		if len(pages) == 0 {
+			pages = append(pages, Page{
+				URL:    normalizeURL(opts.URL),
+				Status: "error",
+				Error:  firstErr.Error(),
+				SEO:    &SEO{},
+			})
+		}
 	}
 
 	data := Report{
@@ -285,6 +297,12 @@ func ReturnReport(data *Report, indent bool, firstError error) ([]byte, error) {
 	return report, firstError
 }
 
+func normalizePages(pages []Page) {
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i].URL < pages[j].URL
+	})
+}
+
 func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
 	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits, limiter *rate.Limiter, cache *AssetsCache) {
 	slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
@@ -311,12 +329,16 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		}
 
 		visits.mu.Lock()
-		if _, ok := visits.isVisited[item.URL]; ok {
+
+		normalizedURL := normalizeURL(item.URL)
+
+		if _, ok := visits.isVisited[normalizedURL]; ok {
 			visits.mu.Unlock()
 			atomic.AddInt32(pendingURLs, -1)
 			continue
 		}
-		visits.isVisited[item.URL] = struct{}{}
+
+		visits.isVisited[normalizedURL] = struct{}{}
 		visits.mu.Unlock()
 
 		// теперь обрабатываем страницу
@@ -327,6 +349,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			atomic.AddInt32(pendingURLs, -1)
 			return
 		}
+
 		req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
 		if err != nil {
 			page.Error = err.Error()
@@ -337,14 +360,27 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		// Устанавливаем User-Agent (имитируем реальный браузер)
 		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
 
+		brLinks := make([]BrokenLinks, 0)
+
 		// Выполняем запрос
 		resp, err := DoRequestWithRetries(req, opts)
 		if err != nil {
+			brLinks = append(brLinks, BrokenLinks{
+				URL: item.URL,
+				Err: err.Error(),
+			})
 			if resp != nil {
-				resp.Body.Close() // Даже при ошибке resp может быть не nil!
+				resp.Body.Close()
 			}
-			errsCh <- fmt.Errorf("get request failed: %w", err)
+			errsCh <- err
 			continue
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			brLinks = append(brLinks, BrokenLinks{
+				URL:        item.URL,
+				StatusCode: resp.StatusCode,
+			})
 		}
 
 		// Сохраним body для дальнейшей работы в разных местах
@@ -367,7 +403,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
-		brLinks, err := ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter)
+		err = ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter, &brLinks)
 		if err != nil {
 			page.Error = err.Error()
 			errsCh <- fmt.Errorf("ArrangeLinks: %w", err)
@@ -396,7 +432,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			status = resp.Status
 		}
 
-		page.URL = item.URL
+		page.URL = normalizeURL(item.URL)
 		page.Depth = item.LinkDepth
 		page.HTTPStatus = resp.StatusCode
 		page.Status = status
@@ -478,14 +514,22 @@ func isInnerLink(checkedURL string, item AliveInnerLink) bool {
 		slog.Error("failed to parse checked URL", "url", checkedURL, "error", err)
 		return false
 	}
+	// Нормализуем оба URL для сравнения
+	normalizedBase := normalizeURL(item.URL)
+	normalizedChecked := normalizeURL(checkedURL)
 
-	// Если ссылка относительная - она внутренняя
-	if !checkedParsed.IsAbs() {
-		return true
+	// Если это та же страница после нормализации - не внутренняя ссылка
+	if normalizedBase == normalizedChecked {
+		return false
 	}
 
-	// Сравниваем хосты
-	return baseParsed.Host == checkedParsed.Host
+	// Если разные хосты - внешняя ссылка
+	if baseParsed.Host != checkedParsed.Host {
+		return false
+	}
+
+	// Если ссылка относительная или тот же хост - внутренняя
+	return true
 }
 
 func makeHEADorGETRequest(ctx context.Context, url string, opts Options) (*http.Response, error) {
@@ -529,14 +573,14 @@ func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Respon
 }
 
 func CollectSEO(body io.Reader) (*SEO, error) {
-	var seo SEO
+	seo := SEO{}
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
 		return &SEO{}, fmt.Errorf("goquery: %w", err)
 	}
 
-	title := doc.Find("title").Text()
+	title := doc.Find("title").First().Text()
 	thereIsTitle := doc.Find("title").Length() > 0
 	if thereIsTitle {
 		seo.HasTitle = true
@@ -559,10 +603,6 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 	repeated := make(map[string]struct{}) //отслеживаем одинаковые ссылки на странице
 	URLs := make([]string, 0, len(links))
 	for _, l := range links {
-		_, ok := repeated[l]
-		if ok {
-			continue // если повторяется, то идем обрабатывать следующую ссылку
-		}
 		abs, err := resolveUrl(opts.URL, l) // преобразуем URLs в абсолютные
 		if err != nil {
 			slog.Warn("failed to resolve URL", "link", l, "error", err)
@@ -572,26 +612,45 @@ func ProcessLinks(links []string, opts *Options) ([]string, error) {
 			continue
 		}
 
-		URLs = append(URLs, abs)
-		repeated[l] = struct{}{}
+		normalized := normalizeURL(abs)
+
+		// Проверяем, не было ли уже нормализованной версии
+		if _, ok := repeated[normalized]; ok {
+			continue
+		}
+
+		URLs = append(URLs, normalized)
+		repeated[normalized] = struct{}{}
 	}
 	return URLs, nil
 }
 
+func normalizeURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	parsed.Fragment = ""
+
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	return parsed.String()
+}
+
 func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
-	pendingURLs *int32, limiter *rate.Limiter) ([]BrokenLinks, error) {
-	brLinks := make([]BrokenLinks, 0)
+	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks) error {
+	//brLinks := make([]BrokenLinks, 0)
 
 	for _, u := range URLs {
 		if err := limiter.Wait(ctx); err != nil {
 			slog.Error("rate limiter", "error", err)
 			atomic.AddInt32(pendingURLs, -1)
-			return brLinks, fmt.Errorf("rate limiter: %w", err)
+			return fmt.Errorf("rate limiter: %w", err)
 		}
 		resp, err := makeHEADorGETRequest(ctx, u, opts)
 		if err != nil {
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
-			brLinks = append(brLinks, BrokenLinks{
+			*brLinks = append(*brLinks, BrokenLinks{
 				URL: u,
 				Err: err.Error(),
 			})
@@ -601,17 +660,18 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 
 		switch {
 		case resp.StatusCode >= http.StatusBadRequest:
-			brLinks = append(brLinks, BrokenLinks{
+			*brLinks = append(*brLinks, BrokenLinks{
 				URL:        u,
 				StatusCode: resp.StatusCode,
 			})
 
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			if isInnerLink(u, item) && item.LinkDepth < opts.Depth { //!!! было не верное условие и не выходил из цикла
+			normalizedURL := normalizeURL(u)
+			if isInnerLink(normalizedURL, item) && item.LinkDepth < opts.Depth {
 				atomic.AddInt32(pendingURLs, 1)
 				select {
 				case queueCh <- AliveInnerLink{
-					URL:       u,
+					URL:       normalizedURL,
 					LinkDepth: item.LinkDepth + 1,
 				}:
 				default:
@@ -624,7 +684,7 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 			slog.Warn("unexpected StatusCode", "url", u, "StatusCode", resp.StatusCode)
 		}
 	}
-	return brLinks, nil
+	return nil
 }
 
 func SetLimit(opts *Options) float64 {
@@ -668,8 +728,15 @@ func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, erro
 	var resp *http.Response
 	var err error
 
+	client := opts.HTTPClient
+	if client == nil {
+		client = &http.Client{
+			Timeout: opts.Timeout,
+		}
+	}
+
 	for attempt := 0; attempt <= opts.Retries; attempt++ {
-		resp, err = opts.HTTPClient.Do(req)
+		resp, err = client.Do(req)
 
 		shouldRetry := false
 
