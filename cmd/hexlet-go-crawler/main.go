@@ -6,9 +6,7 @@ import (
 	"code/logger"
 	"context"
 	"log/slog"
-	"net/http"
 	"os"
-	"time"
 
 	"github.com/urfave/cli/v3"
 )
@@ -89,10 +87,6 @@ func main() {
 			workers := cmd.Int("workers")
 			indent := cmd.Bool("indent-json")
 
-			client := http.Client{
-				Timeout: 5 * time.Second,
-			}
-
 			options := crawler.Options{
 				URL:         url,
 				Depth:       depth,
@@ -102,7 +96,6 @@ func main() {
 				UserAgent:   agent,
 				Concurrency: workers,
 				IndentJSON:  indent,
-				HTTPClient:  &client,
 				RPS:         rps,
 			}
 

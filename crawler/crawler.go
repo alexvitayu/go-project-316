@@ -32,6 +32,10 @@ var supportedSchemes = map[string]bool{
 	"https": true,
 }
 
+type HTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
 type Options struct {
 	URL         string
 	Depth       int
@@ -41,7 +45,7 @@ type Options struct {
 	UserAgent   string
 	Concurrency int
 	IndentJSON  bool
-	HTTPClient  *http.Client
+	HTTPClient  HTTPClient
 	RPS         int
 }
 
@@ -312,6 +316,15 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
 	}()
 
+	client := opts.HTTPClient
+	if client == nil {
+		httpClient := &http.Client{
+			Timeout: opts.Timeout,
+		}
+		client = httpClient
+
+	}
+
 	for item := range queueCh {
 		var page Page
 
@@ -363,7 +376,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		brLinks := make([]BrokenLinks, 0)
 
 		// Выполняем запрос
-		resp, err := DoRequestWithRetries(req, opts)
+		resp, err := DoRequestWithRetries(req, opts, client)
 		if err != nil {
 			brLinks = append(brLinks, BrokenLinks{
 				URL: item.URL,
@@ -403,7 +416,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
-		err = ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter, &brLinks)
+		err = ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter, &brLinks, client)
 		if err != nil {
 			page.Error = err.Error()
 			errsCh <- fmt.Errorf("ArrangeLinks: %w", err)
@@ -418,7 +431,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			continue
 		}
 
-		assets, err := CollectAssets(ctx, opts, item.URL, bytes.NewReader(savedBody), cache)
+		assets, err := CollectAssets(ctx, opts, item.URL, bytes.NewReader(savedBody), cache, client)
 		if err != nil {
 			page.Error = err.Error()
 			errsCh <- fmt.Errorf("CollectAssets: %w", err)
@@ -532,19 +545,19 @@ func isInnerLink(checkedURL string, item AliveInnerLink) bool {
 	return true
 }
 
-func makeHEADorGETRequest(ctx context.Context, url string, opts Options) (*http.Response, error) {
+func makeHEADorGETRequest(ctx context.Context, url string, opts Options, client HTTPClient) (*http.Response, error) {
 	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
-		return makeGetRequest(ctx, url, opts)
+		return makeGetRequest(ctx, url, opts, client)
 	}
 
 	// Устанавливаем User-Agent (имитируем реальный браузер)
 	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
 
 	//headResp, err := opts.HTTPClient.Do(headReq)
-	headResp, err := DoRequestWithRetries(headReq, opts)
+	headResp, err := DoRequestWithRetries(headReq, opts, client)
 	if err != nil {
-		return makeGetRequest(ctx, url, opts)
+		return makeGetRequest(ctx, url, opts, client)
 	}
 
 	// При успешном HEAD запросе возвращаем response
@@ -553,10 +566,10 @@ func makeHEADorGETRequest(ctx context.Context, url string, opts Options) (*http.
 	}
 	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
 	headResp.Body.Close()
-	return makeGetRequest(ctx, url, opts)
+	return makeGetRequest(ctx, url, opts, client)
 }
 
-func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Response, error) {
+func makeGetRequest(ctx context.Context, url string, opts Options, client HTTPClient) (*http.Response, error) {
 	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fail to create get request: %w", err)
@@ -565,7 +578,7 @@ func makeGetRequest(ctx context.Context, url string, opts Options) (*http.Respon
 	getReq.Header.Set("User-Agent", opts.UserAgent)
 
 	//getResp, err := opts.HTTPClient.Do(getReq)
-	getResp, err := DoRequestWithRetries(getReq, opts)
+	getResp, err := DoRequestWithRetries(getReq, opts, client)
 	if err != nil {
 		return nil, fmt.Errorf("fail to make get request: %w", err)
 	}
@@ -638,7 +651,7 @@ func normalizeURL(rawURL string) string {
 }
 
 func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
-	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks) error {
+	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks, client HTTPClient) error {
 	//brLinks := make([]BrokenLinks, 0)
 
 	for _, u := range URLs {
@@ -647,7 +660,7 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 			atomic.AddInt32(pendingURLs, -1)
 			return fmt.Errorf("rate limiter: %w", err)
 		}
-		resp, err := makeHEADorGETRequest(ctx, u, opts)
+		resp, err := makeHEADorGETRequest(ctx, u, opts, client)
 		if err != nil {
 			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
 			*brLinks = append(*brLinks, BrokenLinks{
@@ -724,16 +737,9 @@ func isNetworkError(err error) bool {
 	return false
 }
 
-func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, error) {
+func DoRequestWithRetries(req *http.Request, opts Options, client HTTPClient) (*http.Response, error) {
 	var resp *http.Response
 	var err error
-
-	client := opts.HTTPClient
-	if client == nil {
-		client = &http.Client{
-			Timeout: opts.Timeout,
-		}
-	}
 
 	for attempt := 0; attempt <= opts.Retries; attempt++ {
 		resp, err = client.Do(req)
@@ -775,27 +781,27 @@ func DoRequestWithRetries(req *http.Request, opts Options) (*http.Response, erro
 	return resp, err
 }
 
-func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Reader, cache *AssetsCache) ([]Assets, error) {
+func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Reader, cache *AssetsCache, client HTTPClient) ([]Assets, error) {
 	assets := make([]Assets, 0)
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
 		return []Assets{}, fmt.Errorf("goquery: %w", err)
 	}
-	images := FindAssets(ctx, baseURL, opts, doc, cache, "img")
+	images := FindAssets(ctx, baseURL, opts, doc, cache, client, "img")
 	assets = append(assets, images...)
 
-	scripts := FindAssets(ctx, baseURL, opts, doc, cache, "script[src]")
+	scripts := FindAssets(ctx, baseURL, opts, doc, cache, client, "script[src]")
 	assets = append(assets, scripts...)
 
-	styles := FindAssets(ctx, baseURL, opts, doc, cache, "link[rel='stylesheet']")
+	styles := FindAssets(ctx, baseURL, opts, doc, cache, client, "link[rel='stylesheet']")
 	assets = append(assets, styles...)
 
 	return assets, nil
 }
 
 func FindAssets(ctx context.Context, baseURL string, opts Options,
-	doc *goquery.Document, cache *AssetsCache, asset string) []Assets {
+	doc *goquery.Document, cache *AssetsCache, client HTTPClient, asset string) []Assets {
 	var assets []Assets
 	seen := make(map[string]bool)
 
@@ -830,7 +836,7 @@ func FindAssets(ctx context.Context, baseURL string, opts Options,
 				return
 			}
 
-			resp, err := makeGetRequest(ctx, u, opts)
+			resp, err := makeGetRequest(ctx, u, opts, client)
 			if err != nil {
 				asset := Assets{
 					URL:   u,
