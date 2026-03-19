@@ -226,8 +226,9 @@ func TestArrangeLinks(t *testing.T) {
 		limiter := rate.NewLimiter(rate.Inf, 1)
 		wantLengthBroken := 2
 		brLinks := make([]crawler.BrokenLinks, 0)
+		client := &http.Client{}
 
-		err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter, &brLinks)
+		err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter, &brLinks, client)
 		require.NoError(t, err)
 		assert.Len(t, brLinks, wantLengthBroken)
 	})
@@ -278,7 +279,9 @@ func TestCollectSEO(t *testing.T) {
 			seo, err := crawler.CollectSEO(resp.Body)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantSEO, seo)
-			resp.Body.Close()
+			if err := resp.Body.Close(); err != nil {
+				t.Logf("failed to close response body: %v", err)
+			}
 		})
 	}
 }
@@ -441,10 +444,14 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 
 					if *counter <= 2 {
 						w.WriteHeader(http.StatusTooManyRequests)
-						w.Write([]byte("too many requests"))
+						if _, err := w.Write([]byte("too many requests")); err != nil {
+							_ = err
+						}
 					} else {
 						w.WriteHeader(http.StatusOK)
-						w.Write([]byte("OK"))
+						if _, err := w.Write([]byte("OK")); err != nil {
+							_ = err
+						}
 					}
 				}
 			},
@@ -464,10 +471,14 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 
 					if *counter <= 3 {
 						w.WriteHeader(http.StatusInternalServerError)
-						w.Write([]byte("internal server error"))
+						if _, err := w.Write([]byte("internal server error")); err != nil {
+							_ = err
+						}
 					} else {
 						w.WriteHeader(http.StatusOK)
-						w.Write([]byte("OK"))
+						if _, err := w.Write([]byte("OK")); err != nil {
+							_ = err
+						}
 					}
 				}
 			},
@@ -481,6 +492,7 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			requestCount := 0
+			client := &http.Client{}
 
 			handler := tc.handler(&requestCount)
 
@@ -490,9 +502,13 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 			req, err := http.NewRequestWithContext(t.Context(), tc.method, server.URL, nil)
 			require.NoError(t, err)
 
-			resp, err := crawler.DoRequestWithRetries(req, tc.opts)
+			resp, err := crawler.DoRequestWithRetries(req, tc.opts, client)
 			require.NoError(t, err)
-			defer resp.Body.Close()
+			defer func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Logf("failed to close response body: %v", err)
+				}
+			}()
 
 			assert.Equal(t, tc.wantStatus, resp.StatusCode)
 			assert.Equal(t, tc.wantRequestCount, requestCount)
@@ -624,12 +640,13 @@ func TestDoRequestWithRetries_WithError(t *testing.T) {
 					Request:    req,
 				}, nil
 			})
-			tc.opts.HTTPClient.Transport = transport
+			client := &http.Client{}
+			client.Transport = transport
 
 			req, err := http.NewRequestWithContext(t.Context(), tc.method, "https://test.com", nil)
 			require.NoError(t, err)
 
-			resp, err := crawler.DoRequestWithRetries(req, tc.opts)
+			resp, err := crawler.DoRequestWithRetries(req, tc.opts, client)
 			if tc.isErr {
 				require.Error(t, err)
 				if tc.wantErr != "" {
@@ -637,7 +654,11 @@ func TestDoRequestWithRetries_WithError(t *testing.T) {
 				}
 			} else {
 				require.NoError(t, err)
-				defer resp.Body.Close()
+				defer func() {
+					if err := resp.Body.Close(); err != nil {
+						t.Logf("failed to close response body: %v", err)
+					}
+				}()
 				assert.Equal(t, tc.wantStatus, resp.StatusCode)
 			}
 
@@ -689,20 +710,24 @@ func TestCollectAssets_RepeatedAssets(t *testing.T) {
 
 	testTransport := &RoundTripCounter{}
 
-	opts := crawler.Options{
-		HTTPClient: &http.Client{
-			Transport: testTransport,
-		},
+	client := &http.Client{
+		Transport: testTransport,
 	}
+
+	opts := crawler.Options{}
 
 	req, err := http.NewRequest("GET", "http://example.com", nil)
 	require.NoError(t, err)
 
-	resp, err := opts.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() {
+		if err = resp.Body.Close(); err != nil {
+			t.Logf("failed to close response body: %v", err)
+		}
+	}()
 
-	_, err = crawler.CollectAssets(t.Context(), opts, "http://example.com", resp.Body, cache)
+	_, err = crawler.CollectAssets(t.Context(), opts, "http://example.com", resp.Body, cache, client)
 	require.NoError(t, err)
 
 	require.Equal(t, int32(2), testTransport.count)
@@ -771,16 +796,15 @@ func TestFindAssets(t *testing.T) {
 		SizeBytes:  0,
 		Error:      "404 Not Found",
 	}
-	opts := crawler.Options{
-		HTTPClient: &http.Client{},
-	}
+	client := &http.Client{}
+	opts := crawler.Options{}
 
 	body := strings.NewReader(`<img src="/images/test-image.jpg" alt="Тестовое изображение 1">`)
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	require.NoError(t, err)
 
-	assets := crawler.FindAssets(t.Context(), "http://example.com", opts, doc, cache, "img")
+	assets := crawler.FindAssets(t.Context(), "http://example.com", opts, doc, cache, client, "img")
 
 	assert.Equal(t, expectedAsset, assets[0])
 }

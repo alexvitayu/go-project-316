@@ -101,7 +101,9 @@ func main() {
 
 			report, err := crawler.Analyze(ctx, options)
 			if len(report) > 0 {
-				os.Stdout.Write(report)
+				if _, err = os.Stdout.Write(report); err != nil {
+					return err
+				}
 			}
 			return err
 		},
