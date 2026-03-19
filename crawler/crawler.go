@@ -577,16 +577,13 @@ func makeHEADorGETRequest(ctx context.Context, url string, opts Options, client 
 func makeGetRequest(ctx context.Context, url string, opts Options, client HTTPClient) (*http.Response, error) {
 	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		//return nil, fmt.Errorf("fail to create get request: %w", err)
 		return nil, err
 	}
 
 	getReq.Header.Set("User-Agent", opts.UserAgent)
 
-	//getResp, err := opts.HTTPClient.Do(getReq)
 	getResp, err := DoRequestWithRetries(getReq, opts, client)
 	if err != nil {
-		//return nil, fmt.Errorf("fail to make get request: %w", err)
 		return nil, err
 	}
 	return getResp, nil
@@ -657,56 +654,6 @@ func normalizeURL(rawURL string) string {
 	return parsed.String()
 }
 
-//func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
-//	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks, client HTTPClient) error {
-//	//brLinks := make([]BrokenLinks, 0)
-//
-//	for _, u := range URLs {
-//		if err := limiter.Wait(ctx); err != nil {
-//			slog.Error("rate limiter", "error", err)
-//			atomic.AddInt32(pendingURLs, -1)
-//			return fmt.Errorf("rate limiter: %w", err)
-//		}
-//		resp, err := makeHEADorGETRequest(ctx, u, opts, client)
-//		if err != nil {
-//			//если возникает ошибка при обращении к url, то добавим url и ошибку в список битых ссылок
-//			*brLinks = append(*brLinks, BrokenLinks{
-//				URL: u,
-//				Err: err.Error(),
-//			})
-//			continue
-//		}
-//		resp.Body.Close()
-//
-//		switch {
-//		case resp.StatusCode >= http.StatusBadRequest:
-//			*brLinks = append(*brLinks, BrokenLinks{
-//				URL:        u,
-//				StatusCode: resp.StatusCode,
-//			})
-//
-//		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-//			normalizedURL := normalizeURL(u)
-//			if isInnerLink(normalizedURL, item) && item.LinkDepth < opts.Depth-1 {
-//				atomic.AddInt32(pendingURLs, 1)
-//				select {
-//				case queueCh <- AliveInnerLink{
-//					URL:       normalizedURL,
-//					LinkDepth: item.LinkDepth + 1,
-//				}:
-//				default:
-//					// если буферизованный канал полон, то возвращаем счётчик обратно
-//					atomic.AddInt32(pendingURLs, -1)
-//					slog.Warn("queueCh is full")
-//				}
-//			}
-//		default:
-//			slog.Warn("unexpected StatusCode", "url", u, "StatusCode", resp.StatusCode)
-//		}
-//	}
-//	return nil
-//}
-
 func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
 	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks, client HTTPClient) error {
 	for _, u := range URLs {
@@ -723,17 +670,14 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 				Err: err.Error(),
 			}
 
-			// Пытаемся определить статус код
 			if resp != nil {
 				brokenLink.StatusCode = resp.StatusCode
 			} else {
-				// Проверяем, содержит ли ошибка указание на 404
 				if strings.Contains(err.Error(), "404") ||
 					strings.Contains(err.Error(), "Not Found") {
 					brokenLink.StatusCode = 404
 				}
-				// Для тестов Хекслета можно установить 404 по умолчанию
-				// если это example.com/missing
+
 				if strings.Contains(u, "/missing") {
 					brokenLink.StatusCode = 404
 				}
