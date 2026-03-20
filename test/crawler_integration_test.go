@@ -3,8 +3,8 @@ package test
 import (
 	"bytes"
 	"code/crawler"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -56,6 +57,7 @@ func (tr *TestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func TestCrawler(t *testing.T) {
+	t.Parallel()
 	rt := NewTestResponse("./testdata/example.html", t)
 
 	client := &http.Client{
@@ -69,12 +71,27 @@ func TestCrawler(t *testing.T) {
 		Delay:       0 * time.Microsecond,
 		Timeout:     30000 * time.Second,
 		Concurrency: 2,
-		IndentJSON:  true,
+		IndentJSON:  false,
 		HTTPClient:  client,
 	}
 
+	exp, err := os.ReadFile("./testdata/fixture.json")
+	require.NoError(t, err)
+	var expect crawler.Report
+	if jsErr := json.Unmarshal(exp, &expect); jsErr != nil {
+		t.Log("fail to unmarshal expect", "error", err)
+	}
+	expect.GeneratedAt = ""
+	expect.Pages[0].DiscoveredAt = ""
+
 	res, err := crawler.Analyze(t.Context(), opts)
 	require.NoError(t, err)
+	var result crawler.Report
+	if jErr := json.Unmarshal(res, &result); jErr != nil {
+		t.Log("fail to unmarshal result", "error", err)
+	}
+	result.GeneratedAt = ""
+	result.Pages[0].DiscoveredAt = ""
 
-	fmt.Println(string(res))
+	assert.Equal(t, expect, result)
 }
