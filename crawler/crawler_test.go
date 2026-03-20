@@ -228,7 +228,19 @@ func TestArrangeLinks(t *testing.T) {
 		brLinks := make([]crawler.BrokenLinks, 0)
 		client := &http.Client{}
 
-		err := crawler.ArrangeLinks(t.Context(), sourceLinks, opts, item, queueCh, &pendingURLs, limiter, &brLinks, client)
+		p := crawler.FetchParams{
+			Ctx:         t.Context(),
+			URLs:        sourceLinks,
+			Options:     opts,
+			Item:        item,
+			QueueCh:     queueCh,
+			PendingURLs: &pendingURLs,
+			Limiter:     limiter,
+			BrLinks:     &brLinks,
+			Client:      client,
+		}
+
+		err := crawler.ArrangeLinks(p)
 		require.NoError(t, err)
 		assert.Len(t, brLinks, wantLengthBroken)
 	})
@@ -502,7 +514,7 @@ func TestDoRequestWithRetries_NoError(t *testing.T) {
 			req, err := http.NewRequestWithContext(t.Context(), tc.method, server.URL, nil)
 			require.NoError(t, err)
 
-			resp, err := crawler.DoRequestWithRetries(req, tc.opts, client)
+			resp, err := crawler.DoRequestWithRetries(req, &tc.opts, client)
 			require.NoError(t, err)
 			defer func() {
 				if err := resp.Body.Close(); err != nil {
@@ -646,7 +658,7 @@ func TestDoRequestWithRetries_WithError(t *testing.T) {
 			req, err := http.NewRequestWithContext(t.Context(), tc.method, "https://test.com", nil)
 			require.NoError(t, err)
 
-			resp, err := crawler.DoRequestWithRetries(req, tc.opts, client)
+			resp, err := crawler.DoRequestWithRetries(req, &tc.opts, client)
 			if tc.isErr {
 				require.Error(t, err)
 				if tc.wantErr != "" {
@@ -727,7 +739,7 @@ func TestCollectAssets_RepeatedAssets(t *testing.T) {
 		}
 	}()
 
-	_, err = crawler.CollectAssets(t.Context(), opts, "http://example.com", resp.Body, cache, client)
+	_, err = crawler.CollectAssets(t.Context(), &opts, "http://example.com", resp.Body, cache, client)
 	require.NoError(t, err)
 
 	require.Equal(t, int32(2), testTransport.count)

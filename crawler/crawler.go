@@ -145,6 +145,24 @@ func NewVisits() *Visits {
 	}
 }
 
+type FetchParams struct {
+	Ctx         context.Context
+	QueueCh     chan AliveInnerLink
+	Done        chan<- struct{}
+	ErrsCh      chan<- error
+	PagesCh     chan<- Page
+	Index       int
+	PendingURLs *int32
+	Options     Options
+	Visits      *Visits
+	Limiter     *rate.Limiter
+	Cache       *AssetsCache
+	URLs        []string
+	Item        AliveInnerLink
+	BrLinks     *[]BrokenLinks
+	Client      HTTPClient
+}
+
 // Analyze - Основная точка входа в crawler
 func Analyze(c context.Context, opts Options) ([]byte, error) {
 	// Обработка флага timeout
@@ -192,10 +210,26 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	// инициализируем AssetsCache, чтобы передать его каждому воркеру
 	cache := NewCacheAssets()
 
+	params := &FetchParams{
+		Ctx:         ctx,
+		QueueCh:     queueCh,
+		Done:        done,
+		ErrsCh:      errsCh,
+		PagesCh:     pagesCh,
+		PendingURLs: &pendingURLs,
+		Options:     opts,
+		Visits:      visits,
+		Limiter:     limiter,
+		Cache:       cache,
+	}
+
 	for i := 1; i <= opts.Concurrency; i++ {
-		go func(indx int) {
-			crawlWorker(ctx, queueCh, done, errsCh, pagesCh, indx, &pendingURLs, opts, visits, limiter, cache)
-		}(i)
+		params.Index = i
+		localParams := *params
+
+		go func() {
+			crawlWorker(localParams)
+		}()
 	}
 
 	// это отдельная горутина-наблюдатель, которая ждёт завершения всех задач либо отмены контекста
@@ -307,75 +341,77 @@ func normalizePages(pages []Page) {
 	})
 }
 
-func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- struct{}, errsCh chan<- error,
-	pagesCh chan<- Page, indx int, pendingURLs *int32, opts Options, visits *Visits, limiter *rate.Limiter, cache *AssetsCache) {
-	slog.Debug("goroutine started", "goroutine_id", indx, "status", "running")
+func crawlWorker(p FetchParams) {
+	slog.Debug("goroutine started", "goroutine_id", p.Index, "status", "running")
 
 	defer func() {
-		done <- struct{}{} //сигнал от каждой горутины, что работа окончена
-		slog.Debug("goroutine finished", "goroutine_id", indx, "status", "finished")
+		p.Done <- struct{}{} //сигнал от каждой горутины, что работа окончена
+		slog.Debug("goroutine finished", "goroutine_id", p.Index, "status", "finished")
 	}()
 
-	client := opts.HTTPClient
+	client := p.Options.HTTPClient
 	if client == nil {
 		httpClient := &http.Client{
-			Timeout: opts.Timeout,
+			Timeout: p.Options.Timeout,
 		}
 		client = httpClient
 	}
+	p.Client = client
 
-	for item := range queueCh {
+	for item := range p.QueueCh {
 		var page Page
+		p.Item = item
 
-		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
-			slog.Debug("context done, stopping worker", "goroutine_id", indx)
-			page.Error = ctx.Err().Error()
-			errsCh <- fmt.Errorf("context: %w", ctx.Err())
-			atomic.AddInt32(pendingURLs, -1)
+		if p.Ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
+			slog.Debug("context done, stopping worker", "goroutine_id", p.Index)
+			page.Error = p.Ctx.Err().Error()
+			p.ErrsCh <- fmt.Errorf("context: %w", p.Ctx.Err())
+			atomic.AddInt32(p.PendingURLs, -1)
 			continue
 		}
 
-		if item.LinkDepth > opts.Depth {
-			atomic.AddInt32(pendingURLs, -1)
+		if item.LinkDepth > p.Options.Depth {
+			atomic.AddInt32(p.PendingURLs, -1)
 			continue
 		}
 
-		visits.mu.Lock()
+		p.Visits.mu.Lock()
 
 		normalizedURL := normalizeURL(item.URL)
 
-		if _, ok := visits.isVisited[normalizedURL]; ok {
-			visits.mu.Unlock()
-			atomic.AddInt32(pendingURLs, -1)
+		if _, ok := p.Visits.isVisited[normalizedURL]; ok {
+			p.Visits.mu.Unlock()
+			atomic.AddInt32(p.PendingURLs, -1)
 			continue
 		}
 
-		visits.isVisited[normalizedURL] = struct{}{}
-		visits.mu.Unlock()
+		p.Visits.isVisited[normalizedURL] = struct{}{}
+		p.Visits.mu.Unlock()
 
 		// теперь обрабатываем страницу
 		// Создаем новый запрос
-		if err := limiter.Wait(ctx); err != nil {
+		if err := p.Limiter.Wait(p.Ctx); err != nil {
 			slog.Warn("rate limiter, method wait failed", "error", err)
-			errsCh <- fmt.Errorf("rate limiter: %w", err)
-			atomic.AddInt32(pendingURLs, -1)
+			p.ErrsCh <- fmt.Errorf("rate limiter: %w", err)
+			atomic.AddInt32(p.PendingURLs, -1)
 			return
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
+		req, err := http.NewRequestWithContext(p.Ctx, "GET", item.URL, nil)
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("failed to make request: %w", err)
+			p.ErrsCh <- fmt.Errorf("failed to make request: %w", err)
 			continue
 		}
 
 		// Устанавливаем User-Agent (имитируем реальный браузер)
-		req.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+		req.Header.Set("User-Agent", p.Options.UserAgent) //обход блокировок на некоторых сайтах
 
 		brLinks := make([]BrokenLinks, 0)
+		p.BrLinks = &brLinks
 
 		// Выполняем запрос
-		resp, err := DoRequestWithRetries(req, opts, client)
+		resp, err := DoRequestWithRetries(req, &p.Options, client)
 		if err != nil {
 			brLinks = append(brLinks, BrokenLinks{
 				URL: item.URL,
@@ -386,7 +422,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 					slog.Debug("failed to close response body", "error", err)
 				}
 			}
-			errsCh <- err
+			p.ErrsCh <- err
 			continue
 		}
 
@@ -394,6 +430,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 			brLinks = append(brLinks, BrokenLinks{
 				URL:        item.URL,
 				StatusCode: resp.StatusCode,
+				//Err:        resp.Status,
 			})
 		}
 
@@ -404,7 +441,7 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		}
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("failed to save body: %w", err)
+			p.ErrsCh <- fmt.Errorf("failed to save body: %w", err)
 			continue
 		}
 
@@ -412,17 +449,18 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		links := checkHTML(bytes.NewReader(savedBody))
 
 		// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-		URLs, err := ProcessLinks(links, &opts)
+		URLs, err := ProcessLinks(links, &p.Options)
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("ProcessLinks: %w", err)
+			p.ErrsCh <- fmt.Errorf("ProcessLinks: %w", err)
 			continue
 		}
+		p.URLs = URLs
 
-		err = ArrangeLinks(ctx, URLs, opts, item, queueCh, pendingURLs, limiter, &brLinks, client)
+		err = ArrangeLinks(p)
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("ArrangeLinks: %w", err)
+			p.ErrsCh <- fmt.Errorf("ArrangeLinks: %w", err)
 			continue
 		}
 
@@ -430,14 +468,14 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		seo, err := CollectSEO(bytes.NewReader(savedBody))
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("CollectSEO: %w", err)
+			p.ErrsCh <- fmt.Errorf("CollectSEO: %w", err)
 			continue
 		}
 
-		assets, err := CollectAssets(ctx, opts, item.URL, bytes.NewReader(savedBody), cache, client)
+		assets, err := CollectAssets(p.Ctx, &p.Options, item.URL, bytes.NewReader(savedBody), p.Cache, client)
 		if err != nil {
 			page.Error = err.Error()
-			errsCh <- fmt.Errorf("CollectAssets: %w", err)
+			p.ErrsCh <- fmt.Errorf("CollectAssets: %w", err)
 			continue
 		}
 
@@ -457,9 +495,9 @@ func crawlWorker(ctx context.Context, queueCh chan AliveInnerLink, done chan<- s
 		page.Assets = assets
 		page.DiscoveredAt = time.Now().Format(time.RFC3339)
 
-		pagesCh <- page
+		p.PagesCh <- page
 
-		atomic.AddInt32(pendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
+		atomic.AddInt32(p.PendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
 	}
 }
 
@@ -548,7 +586,7 @@ func isInnerLink(checkedURL string, item AliveInnerLink) bool {
 	return true
 }
 
-func makeHEADorGETRequest(ctx context.Context, url string, opts Options, client HTTPClient) (*http.Response, error) {
+func makeHEADorGETRequest(ctx context.Context, url string, opts *Options, client HTTPClient) (*http.Response, error) {
 	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
 		return makeGetRequest(ctx, url, opts, client)
@@ -574,7 +612,7 @@ func makeHEADorGETRequest(ctx context.Context, url string, opts Options, client 
 	return makeGetRequest(ctx, url, opts, client)
 }
 
-func makeGetRequest(ctx context.Context, url string, opts Options, client HTTPClient) (*http.Response, error) {
+func makeGetRequest(ctx context.Context, url string, opts *Options, client HTTPClient) (*http.Response, error) {
 	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -654,16 +692,15 @@ func normalizeURL(rawURL string) string {
 	return parsed.String()
 }
 
-func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveInnerLink, queueCh chan AliveInnerLink,
-	pendingURLs *int32, limiter *rate.Limiter, brLinks *[]BrokenLinks, client HTTPClient) error {
-	for _, u := range URLs {
-		if err := limiter.Wait(ctx); err != nil {
+func ArrangeLinks(p FetchParams) error {
+	for _, u := range p.URLs {
+		if err := p.Limiter.Wait(p.Ctx); err != nil {
 			slog.Error("rate limiter", "error", err)
-			atomic.AddInt32(pendingURLs, -1)
+			atomic.AddInt32(p.PendingURLs, -1)
 			return fmt.Errorf("rate limiter: %w", err)
 		}
 
-		resp, err := makeHEADorGETRequest(ctx, u, opts, client)
+		resp, err := makeHEADorGETRequest(p.Ctx, u, &p.Options, p.Client)
 		if err != nil {
 			brokenLink := BrokenLinks{
 				URL: u,
@@ -683,7 +720,7 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 				}
 			}
 
-			*brLinks = append(*brLinks, brokenLink)
+			*p.BrLinks = append(*p.BrLinks, brokenLink)
 			continue
 		}
 		if err := resp.Body.Close(); err != nil {
@@ -692,22 +729,23 @@ func ArrangeLinks(ctx context.Context, URLs []string, opts Options, item AliveIn
 
 		switch {
 		case resp.StatusCode >= http.StatusBadRequest:
-			*brLinks = append(*brLinks, BrokenLinks{
+			*p.BrLinks = append(*p.BrLinks, BrokenLinks{
 				URL:        u,
 				StatusCode: resp.StatusCode,
+				Err:        resp.Status,
 			})
 
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			normalizedURL := normalizeURL(u)
-			if isInnerLink(normalizedURL, item) && item.LinkDepth < opts.Depth-1 {
-				atomic.AddInt32(pendingURLs, 1)
+			if isInnerLink(normalizedURL, p.Item) && p.Item.LinkDepth < p.Options.Depth-1 {
+				atomic.AddInt32(p.PendingURLs, 1)
 				select {
-				case queueCh <- AliveInnerLink{
+				case p.QueueCh <- AliveInnerLink{
 					URL:       normalizedURL,
-					LinkDepth: item.LinkDepth + 1,
+					LinkDepth: p.Item.LinkDepth + 1,
 				}:
 				default:
-					atomic.AddInt32(pendingURLs, -1)
+					atomic.AddInt32(p.PendingURLs, -1)
 					slog.Warn("queueCh is full")
 				}
 			}
@@ -755,7 +793,7 @@ func isNetworkError(err error) bool {
 	return false
 }
 
-func DoRequestWithRetries(req *http.Request, opts Options, client HTTPClient) (*http.Response, error) {
+func DoRequestWithRetries(req *http.Request, opts *Options, client HTTPClient) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 
@@ -803,20 +841,20 @@ func DoRequestWithRetries(req *http.Request, opts Options, client HTTPClient) (*
 	return resp, err
 }
 
-func CollectAssets(ctx context.Context, opts Options, baseURL string, body io.Reader, cache *AssetsCache, c HTTPClient) ([]Assets, error) {
+func CollectAssets(ctx context.Context, opts *Options, baseURL string, body io.Reader, cache *AssetsCache, c HTTPClient) ([]Assets, error) {
 	assets := make([]Assets, 0)
 
 	doc, err := goquery.NewDocumentFromReader(body)
 	if err != nil {
 		return []Assets{}, fmt.Errorf("goquery: %w", err)
 	}
-	images := FindAssets(ctx, baseURL, opts, doc, cache, c, "img")
+	images := FindAssets(ctx, baseURL, *opts, doc, cache, c, "img")
 	assets = append(assets, images...)
 
-	scripts := FindAssets(ctx, baseURL, opts, doc, cache, c, "script[src]")
+	scripts := FindAssets(ctx, baseURL, *opts, doc, cache, c, "script[src]")
 	assets = append(assets, scripts...)
 
-	styles := FindAssets(ctx, baseURL, opts, doc, cache, c, "link[rel='stylesheet']")
+	styles := FindAssets(ctx, baseURL, *opts, doc, cache, c, "link[rel='stylesheet']")
 	assets = append(assets, styles...)
 
 	return assets, nil
@@ -858,7 +896,7 @@ func FindAssets(ctx context.Context, baseURL string, opts Options,
 				return
 			}
 
-			resp, err := makeGetRequest(ctx, u, opts, client)
+			resp, err := makeGetRequest(ctx, u, &opts, client)
 			if err != nil {
 				asset := Assets{
 					URL:   u,
