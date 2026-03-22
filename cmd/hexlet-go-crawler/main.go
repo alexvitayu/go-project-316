@@ -3,6 +3,7 @@ package main
 import (
 	"code/config"
 	"code/crawler"
+	"code/internal/models"
 	"code/logger"
 	"context"
 	"log/slog"
@@ -87,7 +88,7 @@ func main() {
 			workers := cmd.Int("workers")
 			indent := cmd.Bool("indent-json")
 
-			options := crawler.Options{
+			options := models.Options{
 				URL:         url,
 				Depth:       depth,
 				Retries:     retries,

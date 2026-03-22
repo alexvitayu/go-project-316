@@ -2,169 +2,31 @@ package crawler
 
 import (
 	"bytes"
+	"code/internal/fetcher"
+	"code/internal/limiter"
+	"code/internal/models"
+	"code/internal/parser"
+	"code/internal/tools"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"sort"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
 	"golang.org/x/time/rate"
 )
 
 const initQueueCapacity = 500
 
-var supportedSchemes = map[string]bool{
-	"http":  true,
-	"https": true,
-}
-
-type HTTPClient interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-
-type Options struct {
-	URL         string
-	Depth       int
-	Retries     int
-	Delay       time.Duration
-	Timeout     time.Duration
-	UserAgent   string
-	Concurrency int
-	IndentJSON  bool
-	HTTPClient  HTTPClient
-	RPS         int
-}
-
-type Page struct {
-	URL          string        `json:"url"`
-	Depth        int           `json:"depth"`
-	HTTPStatus   int           `json:"http_status"`
-	Status       string        `json:"status"`
-	Error        string        `json:"error,omitempty"`
-	SEO          *SEO          `json:"seo"`
-	BrokenLinks  []BrokenLinks `json:"broken_links"`
-	Assets       []Assets      `json:"assets"`
-	DiscoveredAt string        `json:"discovered_at"`
-}
-
-type BrokenLinks struct {
-	URL        string `json:"url"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Err        string `json:"error,omitempty"`
-}
-
-type SEO struct {
-	HasTitle       bool   `json:"has_title"`
-	Title          string `json:"title"`
-	HasDescription bool   `json:"has_description"`
-	Description    string `json:"description"`
-	HasH1          bool   `json:"has_h1"`
-}
-
-type Assets struct {
-	URL        string `json:"url"`
-	Type       string `json:"type"`
-	StatusCode int    `json:"status_code"`
-	SizeBytes  int64  `json:"size_bytes"`
-	Error      string `json:"error,omitempty"`
-}
-
-type Report struct {
-	RootURL     string `json:"root_url"`
-	Depth       int    `json:"depth"`
-	GeneratedAt string `json:"generated_at"`
-	Pages       []Page `json:"pages"`
-}
-
-type AliveInnerLink struct {
-	URL       string
-	LinkDepth int
-}
-
-// AssetsCache здесь реализуем кэш ассетов
-type AssetsCache struct {
-	cache map[string]Assets
-	mu    *sync.Mutex
-}
-
-func NewCacheAssets() *AssetsCache {
-	return &AssetsCache{
-		cache: make(map[string]Assets),
-		mu:    &sync.Mutex{},
-	}
-}
-
-func (c *AssetsCache) AddToCache(url string, assets Assets) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, exists := c.cache[url]; !exists {
-		c.cache[url] = assets
-	}
-}
-
-func (c *AssetsCache) IsThereInCache(url string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.cache[url]
-	return ok
-}
-
-func (c *AssetsCache) TakeFromCache(url string) Assets {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	asset, exists := c.cache[url]
-	if exists {
-		return asset
-	}
-	return Assets{}
-}
-
-type Visits struct {
-	mu        *sync.Mutex
-	isVisited map[string]struct{}
-}
-
-func NewVisits() *Visits {
-	return &Visits{
-		isVisited: make(map[string]struct{}),
-		mu:        &sync.Mutex{},
-	}
-}
-
-type FetchParams struct {
-	Ctx         context.Context
-	QueueCh     chan AliveInnerLink
-	Done        chan<- struct{}
-	ErrsCh      chan<- error
-	PagesCh     chan<- Page
-	Index       int
-	PendingURLs *int32
-	Options     Options
-	Visits      *Visits
-	Limiter     *rate.Limiter
-	Cache       *AssetsCache
-	URLs        []string
-	Item        AliveInnerLink
-	BrLinks     *[]BrokenLinks
-	Client      HTTPClient
-}
-
 // Analyze - Основная точка входа в crawler
-func Analyze(c context.Context, opts Options) ([]byte, error) {
+func Analyze(c context.Context, opts models.Options) ([]byte, error) {
 	// Обработка флага timeout
 	ctx, cancel := context.WithTimeout(c, opts.Timeout)
 	defer cancel()
@@ -179,22 +41,15 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 
 	// введём limiter, с его помощью ограничиваем число запросов в единицу времени и используем его
 	// как шлагбаум в местах запросов
-	rps := SetLimit(&opts)
-	var limit rate.Limit
-	if rps <= 0 {
-		limit = rate.Inf // количество запросов за секунду не ограничено
-	} else if rps > 0 {
-		limit = rate.Limit(rps)
-	}
-	limiter := rate.NewLimiter(limit, opts.Concurrency)
+	limiter := rate.NewLimiter(limiter.SetUpLimit(limiter.FindOutRPS(&opts)), opts.Concurrency)
 
 	// инициализируем структуру, которая собирает посещения и контроллирует конкурентный доступ к данным
-	visits := NewVisits()
+	visits := models.NewVisits()
 
 	// инициализируем каналы для очереди адресов, ошибок, обработанных страниц и сигнальный канал done вместо wg
-	queueCh := make(chan AliveInnerLink, initQueueCapacity)
+	queueCh := make(chan models.AliveInnerLink, initQueueCapacity)
 	errsCh := make(chan error, opts.Concurrency*2)
-	pagesCh := make(chan Page, 100)
+	pagesCh := make(chan models.Page, 100)
 	done := make(chan struct{}, opts.Concurrency)
 
 	// Счётчик активных задач в очереди
@@ -202,15 +57,15 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 
 	// добавляем в очередь базовый url с глубиной 0
 	atomic.AddInt32(&pendingURLs, 1)
-	queueCh <- AliveInnerLink{
+	queueCh <- models.AliveInnerLink{
 		URL:       opts.URL,
 		LinkDepth: 0,
 	}
 
 	// инициализируем AssetsCache, чтобы передать его каждому воркеру
-	cache := NewCacheAssets()
+	cache := models.NewCacheAssets()
 
-	params := &FetchParams{
+	params := &models.FetchCrawlParams{
 		Ctx:         ctx,
 		QueueCh:     queueCh,
 		Done:        done,
@@ -267,7 +122,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	}()
 
 	// блок сбора результатов
-	var pages []Page
+	var pages []models.Page
 	var errs []error
 
 	for pagesCh != nil || errsCh != nil {
@@ -296,16 +151,16 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	if len(errs) > 0 {
 		firstErr = errs[0]
 		if len(pages) == 0 {
-			pages = append(pages, Page{
-				URL:    normalizeURL(opts.URL),
+			pages = append(pages, models.Page{
+				URL:    tools.NormalizeURL(opts.URL),
 				Status: "error",
 				Error:  firstErr.Error(),
-				SEO:    &SEO{},
+				SEO:    &models.SEO{},
 			})
 		}
 	}
 
-	data := Report{
+	data := models.Report{
 		RootURL:     opts.URL,
 		Depth:       opts.Depth,
 		GeneratedAt: time.Now().Format(time.RFC3339),
@@ -315,7 +170,7 @@ func Analyze(c context.Context, opts Options) ([]byte, error) {
 	return ReturnReport(&data, opts.IndentJSON, firstErr)
 }
 
-func ReturnReport(data *Report, indent bool, firstError error) ([]byte, error) {
+func ReturnReport(data *models.Report, indent bool, firstError error) ([]byte, error) {
 	var (
 		report []byte
 		err    error
@@ -335,13 +190,13 @@ func ReturnReport(data *Report, indent bool, firstError error) ([]byte, error) {
 	return report, firstError
 }
 
-func normalizePages(pages []Page) {
+func normalizePages(pages []models.Page) {
 	sort.Slice(pages, func(i, j int) bool {
 		return pages[i].URL < pages[j].URL
 	})
 }
 
-func crawlWorker(p FetchParams) {
+func crawlWorker(p models.FetchCrawlParams) {
 	slog.Debug("goroutine started", "goroutine_id", p.Index, "status", "running")
 
 	defer func() {
@@ -359,7 +214,7 @@ func crawlWorker(p FetchParams) {
 	p.Client = client
 
 	for item := range p.QueueCh {
-		var page Page
+		var page models.Page
 		p.Item = item
 
 		if p.Ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
@@ -375,18 +230,18 @@ func crawlWorker(p FetchParams) {
 			continue
 		}
 
-		p.Visits.mu.Lock()
+		p.Visits.Mu.Lock()
 
-		normalizedURL := normalizeURL(item.URL)
+		normalizedURL := tools.NormalizeURL(item.URL)
 
-		if _, ok := p.Visits.isVisited[normalizedURL]; ok {
-			p.Visits.mu.Unlock()
+		if _, ok := p.Visits.IsVisited[normalizedURL]; ok {
+			p.Visits.Mu.Unlock()
 			atomic.AddInt32(p.PendingURLs, -1)
 			continue
 		}
 
-		p.Visits.isVisited[normalizedURL] = struct{}{}
-		p.Visits.mu.Unlock()
+		p.Visits.IsVisited[normalizedURL] = struct{}{}
+		p.Visits.Mu.Unlock()
 
 		// теперь обрабатываем страницу
 		// Создаем новый запрос
@@ -407,13 +262,13 @@ func crawlWorker(p FetchParams) {
 		// Устанавливаем User-Agent (имитируем реальный браузер)
 		req.Header.Set("User-Agent", p.Options.UserAgent) //обход блокировок на некоторых сайтах
 
-		brLinks := make([]BrokenLinks, 0)
+		brLinks := make([]models.BrokenLinks, 0)
 		p.BrLinks = &brLinks
 
 		// Выполняем запрос
-		resp, err := DoRequestWithRetries(req, &p.Options, client)
+		resp, err := fetcher.DoRequestWithRetries(req, &p.Options, client)
 		if err != nil {
-			brLinks = append(brLinks, BrokenLinks{
+			brLinks = append(brLinks, models.BrokenLinks{
 				URL: item.URL,
 				Err: err.Error(),
 			})
@@ -427,7 +282,7 @@ func crawlWorker(p FetchParams) {
 		}
 
 		if resp.StatusCode >= http.StatusBadRequest {
-			brLinks = append(brLinks, BrokenLinks{
+			brLinks = append(brLinks, models.BrokenLinks{
 				URL:        item.URL,
 				StatusCode: resp.StatusCode,
 				//Err:        resp.Status,
@@ -446,10 +301,10 @@ func crawlWorker(p FetchParams) {
 		}
 
 		// Извлекаем ссылки из страницы
-		links := checkHTML(bytes.NewReader(savedBody))
+		links := parser.ParseHTML(bytes.NewReader(savedBody))
 
 		// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
-		URLs, err := ProcessLinks(links, &p.Options)
+		URLs, err := tools.ProcessLinks(links, &p.Options)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("ProcessLinks: %w", err)
@@ -457,7 +312,7 @@ func crawlWorker(p FetchParams) {
 		}
 		p.URLs = URLs
 
-		err = ArrangeLinks(p)
+		err = fetcher.ArrangeLinks(p)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("ArrangeLinks: %w", err)
@@ -465,14 +320,23 @@ func crawlWorker(p FetchParams) {
 		}
 
 		// Соберём SEO из полученной html страницы
-		seo, err := CollectSEO(bytes.NewReader(savedBody))
+		seo, err := parser.CollectSEO(bytes.NewReader(savedBody))
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("CollectSEO: %w", err)
 			continue
 		}
 
-		assets, err := CollectAssets(p.Ctx, &p.Options, item.URL, bytes.NewReader(savedBody), p.Cache, client)
+		assetPrms := models.FetchCollectParams{
+			Ctx:     p.Ctx,
+			Opts:    p.Options,
+			BaseURL: item.URL,
+			Body:    bytes.NewReader(savedBody),
+			Cache:   p.Cache,
+			Client:  client,
+		}
+
+		assets, err := parser.CollectAssets(assetPrms)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("CollectAssets: %w", err)
@@ -486,7 +350,7 @@ func crawlWorker(p FetchParams) {
 			status = resp.Status
 		}
 
-		page.URL = normalizeURL(item.URL)
+		page.URL = tools.NormalizeURL(item.URL)
 		page.Depth = item.LinkDepth
 		page.HTTPStatus = resp.StatusCode
 		page.Status = status
@@ -499,483 +363,4 @@ func crawlWorker(p FetchParams) {
 
 		atomic.AddInt32(p.PendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
 	}
-}
-
-func checkHTML(r io.Reader) []string {
-	var links []string
-
-	doc, err := html.Parse(r)
-	if err != nil {
-		slog.Error("checkHTML", "parse html failed", err)
-		return nil
-	}
-
-	for n := range doc.Descendants() { // итерируемся по потомкам descendants
-		if n.Type == html.ElementNode && n.DataAtom == atom.A { // atom.A это то же самое, что и тег <a> (ссылка)
-			for _, a := range n.Attr {
-				if a.Key == "href" {
-					links = append(links, a.Val)
-				}
-			}
-		}
-	}
-	return links
-}
-
-func resolveUrl(baseURL, rawURL string) (string, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", fmt.Errorf("resolveUrl: %w", err)
-	}
-
-	if u.IsAbs() {
-		return u.String(), nil
-	}
-
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("resolveUrl: %w", err)
-	}
-
-	abs := base.ResolveReference(u)
-	return abs.String(), nil
-}
-
-func isValidURL(rawURL string) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return false
-	}
-
-	return supportedSchemes[parsed.Scheme]
-}
-
-func isInnerLink(checkedURL string, item AliveInnerLink) bool {
-	// Парсим базовый URL
-	baseParsed, err := url.Parse(item.URL)
-	if err != nil {
-		slog.Error("failed to parse base URL", "url", item.URL, "error", err)
-		return false
-	}
-
-	// Парсим проверяемый URL
-	checkedParsed, err := url.Parse(checkedURL)
-	if err != nil {
-		slog.Error("failed to parse checked URL", "url", checkedURL, "error", err)
-		return false
-	}
-	// Нормализуем оба URL для сравнения
-	normalizedBase := normalizeURL(item.URL)
-	normalizedChecked := normalizeURL(checkedURL)
-
-	// Если это та же страница после нормализации - не внутренняя ссылка
-	if normalizedBase == normalizedChecked {
-		return false
-	}
-
-	// Если разные хосты - внешняя ссылка
-	if baseParsed.Host != checkedParsed.Host {
-		return false
-	}
-
-	// Если ссылка относительная или тот же хост - внутренняя
-	return true
-}
-
-func makeHEADorGETRequest(ctx context.Context, url string, opts *Options, client HTTPClient) (*http.Response, error) {
-	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
-	if err != nil {
-		return makeGetRequest(ctx, url, opts, client)
-	}
-
-	// Устанавливаем User-Agent (имитируем реальный браузер)
-	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-	//headResp, err := opts.HTTPClient.Do(headReq)
-	headResp, err := DoRequestWithRetries(headReq, opts, client)
-	if err != nil {
-		return makeGetRequest(ctx, url, opts, client)
-	}
-
-	// При успешном HEAD запросе возвращаем response
-	if headResp.StatusCode >= 200 && headResp.StatusCode < 300 {
-		return headResp, nil
-	}
-	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
-	if err := headResp.Body.Close(); err != nil {
-		slog.Debug("failed to close HEAD response body", "error", err)
-	}
-	return makeGetRequest(ctx, url, opts, client)
-}
-
-func makeGetRequest(ctx context.Context, url string, opts *Options, client HTTPClient) (*http.Response, error) {
-	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	getReq.Header.Set("User-Agent", opts.UserAgent)
-
-	getResp, err := DoRequestWithRetries(getReq, opts, client)
-	if err != nil {
-		return nil, err
-	}
-	return getResp, nil
-}
-
-func CollectSEO(body io.Reader) (*SEO, error) {
-	seo := SEO{}
-
-	doc, err := goquery.NewDocumentFromReader(body)
-	if err != nil {
-		return &SEO{}, fmt.Errorf("goquery: %w", err)
-	}
-
-	title := doc.Find("title").First().Text()
-	thereIsTitle := doc.Find("title").Length() > 0
-	if thereIsTitle {
-		seo.HasTitle = true
-		seo.Title = html.UnescapeString(title)
-	}
-
-	dscr, exists := doc.Find("meta[name='description']").Attr("content")
-	if exists {
-		seo.HasDescription = true
-		seo.Description = html.UnescapeString(dscr)
-	}
-
-	if exists := doc.Find("h1").Length() > 0; exists {
-		seo.HasH1 = true
-	}
-	return &seo, nil
-}
-
-func ProcessLinks(links []string, opts *Options) ([]string, error) {
-	repeated := make(map[string]struct{}) //отслеживаем одинаковые ссылки на странице
-	URLs := make([]string, 0, len(links))
-	for _, l := range links {
-		abs, err := resolveUrl(opts.URL, l) // преобразуем URLs в абсолютные
-		if err != nil {
-			slog.Warn("failed to resolve URL", "link", l, "error", err)
-			continue
-		}
-		if abs == "" || !isValidURL(abs) {
-			continue
-		}
-
-		normalized := normalizeURL(abs)
-
-		// Проверяем, не было ли уже нормализованной версии
-		if _, ok := repeated[normalized]; ok {
-			continue
-		}
-
-		URLs = append(URLs, normalized)
-		repeated[normalized] = struct{}{}
-	}
-	return URLs, nil
-}
-
-func normalizeURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-	parsed.Fragment = ""
-
-	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
-
-	return parsed.String()
-}
-
-func ArrangeLinks(p FetchParams) error {
-	for _, u := range p.URLs {
-		if err := p.Limiter.Wait(p.Ctx); err != nil {
-			slog.Error("rate limiter", "error", err)
-			atomic.AddInt32(p.PendingURLs, -1)
-			return fmt.Errorf("rate limiter: %w", err)
-		}
-
-		resp, err := makeHEADorGETRequest(p.Ctx, u, &p.Options, p.Client)
-		if err != nil {
-			brokenLink := BrokenLinks{
-				URL: u,
-				Err: err.Error(),
-			}
-
-			if resp != nil {
-				brokenLink.StatusCode = resp.StatusCode
-			} else {
-				if strings.Contains(err.Error(), "404") ||
-					strings.Contains(err.Error(), "Not Found") {
-					brokenLink.StatusCode = 404
-				}
-
-				if strings.Contains(u, "/missing") {
-					brokenLink.StatusCode = 404
-				}
-			}
-
-			*p.BrLinks = append(*p.BrLinks, brokenLink)
-			continue
-		}
-		if err := resp.Body.Close(); err != nil {
-			slog.Debug("failed to close response body", "error", err)
-		}
-
-		switch {
-		case resp.StatusCode >= http.StatusBadRequest:
-			*p.BrLinks = append(*p.BrLinks, BrokenLinks{
-				URL:        u,
-				StatusCode: resp.StatusCode,
-				Err:        resp.Status,
-			})
-
-		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			normalizedURL := normalizeURL(u)
-			if isInnerLink(normalizedURL, p.Item) && p.Item.LinkDepth < p.Options.Depth-1 {
-				atomic.AddInt32(p.PendingURLs, 1)
-				select {
-				case p.QueueCh <- AliveInnerLink{
-					URL:       normalizedURL,
-					LinkDepth: p.Item.LinkDepth + 1,
-				}:
-				default:
-					atomic.AddInt32(p.PendingURLs, -1)
-					slog.Warn("queueCh is full")
-				}
-			}
-		default:
-			slog.Warn("unexpected status code", "url", u, "status_code", resp.StatusCode)
-		}
-	}
-	return nil
-}
-
-func SetLimit(opts *Options) float64 {
-	var limit float64
-	switch {
-	case opts.RPS != 0 && opts.Delay != 0:
-		limit = float64(opts.RPS)
-
-	case opts.RPS == 0 && opts.Delay != 0:
-		str := opts.Delay.String()
-		if strings.HasSuffix(str, "ms") {
-			limit = float64(1000*time.Millisecond) / float64(opts.Delay)
-		} else if strings.HasSuffix(str, "s") {
-			limit = float64(time.Second) / float64(opts.Delay)
-		}
-
-	case opts.Delay == 0 && opts.RPS != 0:
-		limit = float64(opts.RPS)
-	default:
-		limit = 0
-	}
-	return limit
-}
-
-func isNetworkError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	if strings.Contains(err.Error(), "connection reset") ||
-		strings.Contains(err.Error(), "broken pipe") ||
-		strings.Contains(err.Error(), "connection refused") ||
-		strings.Contains(err.Error(), "no such host") ||
-		strings.Contains(err.Error(), "network is unreachable") {
-		return true
-	}
-	return false
-}
-
-func DoRequestWithRetries(req *http.Request, opts *Options, client HTTPClient) (*http.Response, error) {
-	var resp *http.Response
-	var err error
-
-	for attempt := 0; attempt <= opts.Retries; attempt++ {
-		resp, err = client.Do(req)
-
-		shouldRetry := false
-
-		if err != nil {
-			if isNetworkError(err) {
-				shouldRetry = true
-				slog.Debug("network error, retrying request",
-					"attempt", attempt,
-					"error", err,
-					"url", req.URL.String())
-			}
-		} else {
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-				shouldRetry = true
-				slog.Debug("retrying request",
-					"attempt", attempt,
-					"statusCode", resp.StatusCode,
-					"url", req.URL.String())
-			}
-		}
-
-		if !shouldRetry {
-			return resp, err
-		}
-
-		if attempt == opts.Retries {
-			return resp, err
-		}
-
-		if resp != nil {
-			if respErr := resp.Body.Close(); respErr != nil {
-				slog.Debug("failed to close response body during retry",
-					"attempt", attempt,
-					"error", respErr)
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-	return resp, err
-}
-
-func CollectAssets(ctx context.Context, opts *Options, baseURL string, body io.Reader, cache *AssetsCache, c HTTPClient) ([]Assets, error) {
-	assets := make([]Assets, 0)
-
-	doc, err := goquery.NewDocumentFromReader(body)
-	if err != nil {
-		return []Assets{}, fmt.Errorf("goquery: %w", err)
-	}
-	images := FindAssets(ctx, baseURL, *opts, doc, cache, c, "img")
-	assets = append(assets, images...)
-
-	scripts := FindAssets(ctx, baseURL, *opts, doc, cache, c, "script[src]")
-	assets = append(assets, scripts...)
-
-	styles := FindAssets(ctx, baseURL, *opts, doc, cache, c, "link[rel='stylesheet']")
-	assets = append(assets, styles...)
-
-	return assets, nil
-}
-
-func FindAssets(ctx context.Context, baseURL string, opts Options,
-	doc *goquery.Document, cache *AssetsCache, client HTTPClient, asset string) []Assets {
-	var assets []Assets
-	seen := make(map[string]bool)
-
-	attrName := func(assetType string) string {
-		switch assetType {
-		case "img", "script[src]":
-			return "src"
-		case "link[rel='stylesheet']":
-			return "href"
-		default:
-			return ""
-		}
-	}(asset)
-
-	doc.Find(asset).Each(func(_ int, s *goquery.Selection) {
-		if attrVal, exists := s.Attr(attrName); exists && attrVal != "" {
-			u, err := resolveUrl(baseURL, attrVal)
-			if err != nil {
-				slog.Error("failed to resolve %s URL",
-					"src", attrVal,
-					"error", err)
-				return
-			}
-
-			if seen[u] {
-				return
-			}
-			seen[u] = true
-
-			if cache.IsThereInCache(u) {
-				assets = append(assets, cache.TakeFromCache(u))
-				return
-			}
-
-			resp, err := makeGetRequest(ctx, u, &opts, client)
-			if err != nil {
-				asset := Assets{
-					URL:   u,
-					Type:  determineAsset(asset),
-					Error: err.Error(),
-				}
-				assets = append(assets, asset)
-				cache.AddToCache(u, asset)
-				return
-			}
-
-			if resp.StatusCode >= 400 {
-				asset := Assets{
-					URL:        u,
-					Type:       determineAsset(asset),
-					StatusCode: resp.StatusCode,
-					Error:      resp.Status,
-				}
-				assets = append(assets, asset)
-				cache.AddToCache(u, asset)
-				return
-			}
-
-			size, err := FindOutContentLength(resp)
-			if err != nil {
-				slog.Debug("could not determine %s size",
-					"url", u,
-					"error", err)
-			}
-
-			if resp.Body != nil {
-				if err := resp.Body.Close(); err != nil {
-					slog.Debug("failed to close asset response body",
-						"url", u,
-						"error", err)
-				}
-			}
-
-			asset := Assets{
-				URL:        u,
-				Type:       determineAsset(asset),
-				StatusCode: resp.StatusCode,
-				SizeBytes:  size,
-			}
-			assets = append(assets, asset)
-			cache.AddToCache(u, asset)
-		}
-	})
-	return assets
-}
-
-func FindOutContentLength(resp *http.Response) (int64, error) {
-	if resp.Body == nil {
-		return 0, errors.New("response body is nil")
-	}
-
-	if resp.ContentLength > 0 {
-		return resp.ContentLength, nil
-	}
-
-	if resp.ContentLength == -1 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return 0, fmt.Errorf("failed to read body: %w", err)
-		}
-		size := int64(len(body))
-		return size, nil
-	}
-	return 0, nil
-}
-
-func determineAsset(asset string) string {
-	switch asset {
-	case "img":
-		return "image"
-	case "script[src]":
-		return "script"
-	case "link[rel='stylesheet']":
-		return "style"
-	}
-	return ""
 }
