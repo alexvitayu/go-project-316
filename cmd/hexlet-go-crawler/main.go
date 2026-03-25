@@ -7,6 +7,7 @@ import (
 	"code/logger"
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 
 	"github.com/urfave/cli/v3"
@@ -26,7 +27,6 @@ func main() {
 	slog.Debug("APP_ENV", "app_env", cfg.APPEnv)
 
 	cmd := &cli.Command{
-
 		Name:            "hexlet-go-crawler",
 		Usage:           "analyze a website structure",
 		UsageText:       "hexlet-go-crawler [global options] command [command options] <url>",
@@ -88,6 +88,10 @@ func main() {
 			workers := cmd.Int("workers")
 			indent := cmd.Bool("indent-json")
 
+			httpClient := &http.Client{
+				Timeout: timeout,
+			}
+
 			options := models.Options{
 				URL:         url,
 				Depth:       depth,
@@ -97,6 +101,7 @@ func main() {
 				UserAgent:   agent,
 				Concurrency: workers,
 				IndentJSON:  indent,
+				HTTPClient:  httpClient,
 				RPS:         rps,
 			}
 

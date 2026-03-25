@@ -1,9 +1,11 @@
 package parser
 
 import (
+	"code/internal/cache/assetscache"
 	"code/internal/fetcher"
 	"code/internal/models"
 	"code/internal/tools"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +16,15 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
+
+type FetchCollectParams struct {
+	Opts    models.Options
+	BaseURL string
+	Body    io.Reader
+	Cache   *assetscache.AssetsCache
+	Client  http.Client
+	Doc     *goquery.Document
+}
 
 func ParseHTML(r io.Reader) []string {
 	var links []string
@@ -36,7 +47,7 @@ func ParseHTML(r io.Reader) []string {
 	return links
 }
 
-func CollectAssets(p models.FetchCollectParams) ([]models.Assets, error) {
+func CollectAssets(ctx context.Context, p FetchCollectParams) ([]models.Assets, error) {
 	assets := make([]models.Assets, 0)
 
 	doc, err := goquery.NewDocumentFromReader(p.Body)
@@ -44,19 +55,19 @@ func CollectAssets(p models.FetchCollectParams) ([]models.Assets, error) {
 		return []models.Assets{}, fmt.Errorf("goquery: %w", err)
 	}
 	p.Doc = doc
-	images := FindAssets(p, "img")
+	images := FindAssets(ctx, p, "img")
 	assets = append(assets, images...)
 
-	scripts := FindAssets(p, "script[src]")
+	scripts := FindAssets(ctx, p, "script[src]")
 	assets = append(assets, scripts...)
 
-	styles := FindAssets(p, "link[rel='stylesheet']")
+	styles := FindAssets(ctx, p, "link[rel='stylesheet']")
 	assets = append(assets, styles...)
 
 	return assets, nil
 }
 
-func FindAssets(p models.FetchCollectParams, asset string) []models.Assets {
+func FindAssets(ctx context.Context, p FetchCollectParams, asset string) []models.Assets {
 	var assets []models.Assets
 	seen := make(map[string]bool)
 
@@ -91,7 +102,7 @@ func FindAssets(p models.FetchCollectParams, asset string) []models.Assets {
 				return
 			}
 
-			resp, err := fetcher.MakeGetRequest(p.Ctx, u, &p.Opts, p.Client)
+			resp, err := fetcher.MakeGetRequest(ctx, u, &p.Opts)
 			if err != nil {
 				asset := models.Assets{
 					URL:   u,
@@ -143,6 +154,33 @@ func FindAssets(p models.FetchCollectParams, asset string) []models.Assets {
 	return assets
 }
 
+func CollectSEO(body io.Reader) (*models.SEO, error) {
+	seo := models.SEO{}
+
+	doc, err := goquery.NewDocumentFromReader(body)
+	if err != nil {
+		return &models.SEO{}, fmt.Errorf("goquery: %w", err)
+	}
+
+	title := doc.Find("title").First().Text()
+	thereIsTitle := doc.Find("title").Length() > 0
+	if thereIsTitle {
+		seo.HasTitle = true
+		seo.Title = html.UnescapeString(title)
+	}
+
+	dscr, exists := doc.Find("meta[name='description']").Attr("content")
+	if exists {
+		seo.HasDescription = true
+		seo.Description = html.UnescapeString(dscr)
+	}
+
+	if exists := doc.Find("h1").Length() > 0; exists {
+		seo.HasH1 = true
+	}
+	return &seo, nil
+}
+
 func FindOutContentLength(resp *http.Response) (int64, error) {
 	if resp.Body == nil {
 		return 0, errors.New("response body is nil")
@@ -173,31 +211,4 @@ func determineAsset(asset string) string {
 		return "style"
 	}
 	return ""
-}
-
-func CollectSEO(body io.Reader) (*models.SEO, error) {
-	seo := models.SEO{}
-
-	doc, err := goquery.NewDocumentFromReader(body)
-	if err != nil {
-		return &models.SEO{}, fmt.Errorf("goquery: %w", err)
-	}
-
-	title := doc.Find("title").First().Text()
-	thereIsTitle := doc.Find("title").Length() > 0
-	if thereIsTitle {
-		seo.HasTitle = true
-		seo.Title = html.UnescapeString(title)
-	}
-
-	dscr, exists := doc.Find("meta[name='description']").Attr("content")
-	if exists {
-		seo.HasDescription = true
-		seo.Description = html.UnescapeString(dscr)
-	}
-
-	if exists := doc.Find("h1").Length() > 0; exists {
-		seo.HasH1 = true
-	}
-	return &seo, nil
 }

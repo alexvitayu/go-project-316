@@ -1,69 +1,48 @@
 package fetcher
 
 import (
+	"code/internal/cache/assetscache"
 	"code/internal/models"
 	"code/internal/tools"
+	"code/internal/tools/seen"
 	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync/atomic"
-	"time"
+
+	"golang.org/x/time/rate"
 )
 
-func makeHEADorGETRequest(ctx context.Context, url string, opts *models.Options, client models.HTTPClient) (*http.Response, error) {
-	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
-	if err != nil {
-		return MakeGetRequest(ctx, url, opts, client)
-	}
-
-	// Устанавливаем User-Agent (имитируем реальный браузер)
-	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-	//headResp, err := opts.HTTPClient.Do(headReq)
-	headResp, err := DoRequestWithRetries(headReq, opts, client)
-	if err != nil {
-		return MakeGetRequest(ctx, url, opts, client)
-	}
-
-	// При успешном HEAD запросе возвращаем response
-	if headResp.StatusCode >= 200 && headResp.StatusCode < 300 {
-		return headResp, nil
-	}
-	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
-	if err := headResp.Body.Close(); err != nil {
-		slog.Debug("failed to close HEAD response body", "error", err)
-	}
-	return MakeGetRequest(ctx, url, opts, client)
+type FetchCrawlParams struct {
+	QueueCh     chan models.AliveInnerLink
+	Done        chan<- struct{}
+	ErrsCh      chan<- error
+	PagesCh     chan<- models.Page
+	Index       int
+	PendingURLs *int32
+	Options     models.Options
+	Visits      *seen.Visits
+	Limiter     *rate.Limiter
+	Cache       *assetscache.AssetsCache
+	URLs        []string
+	Item        models.AliveInnerLink
+	BrLinks     *[]models.BrokenLink
+	Client      http.Client
 }
 
-func MakeGetRequest(ctx context.Context, url string, opts *models.Options, client models.HTTPClient) (*http.Response, error) {
-	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	getReq.Header.Set("User-Agent", opts.UserAgent)
-
-	getResp, err := DoRequestWithRetries(getReq, opts, client)
-	if err != nil {
-		return nil, err
-	}
-	return getResp, nil
-}
-
-func ArrangeLinks(p models.FetchCrawlParams) error {
+func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 	for _, u := range p.URLs {
-		if err := p.Limiter.Wait(p.Ctx); err != nil {
+		if err := p.Limiter.Wait(ctx); err != nil {
 			slog.Error("rate limiter", "error", err)
 			atomic.AddInt32(p.PendingURLs, -1)
 			return fmt.Errorf("rate limiter: %w", err)
 		}
 
-		resp, err := makeHEADorGETRequest(p.Ctx, u, &p.Options, p.Client)
+		resp, err := makeHEADorGETRequest(ctx, u, &p.Options)
 		if err != nil {
-			brokenLink := models.BrokenLinks{
+			brokenLink := models.BrokenLink{
 				URL: u,
 				Err: err.Error(),
 			}
@@ -90,7 +69,7 @@ func ArrangeLinks(p models.FetchCrawlParams) error {
 
 		switch {
 		case resp.StatusCode >= http.StatusBadRequest:
-			*p.BrLinks = append(*p.BrLinks, models.BrokenLinks{
+			*p.BrLinks = append(*p.BrLinks, models.BrokenLink{
 				URL:        u,
 				StatusCode: resp.StatusCode,
 				Err:        resp.Status,
@@ -117,65 +96,43 @@ func ArrangeLinks(p models.FetchCrawlParams) error {
 	return nil
 }
 
-func DoRequestWithRetries(req *http.Request, opts *models.Options, client models.HTTPClient) (*http.Response, error) {
-	var resp *http.Response
-	var err error
-
-	for attempt := 0; attempt <= opts.Retries; attempt++ {
-		resp, err = client.Do(req)
-
-		shouldRetry := false
-
-		if err != nil {
-			if isNetworkError(err) {
-				shouldRetry = true
-				slog.Debug("network error, retrying request",
-					"attempt", attempt,
-					"error", err,
-					"url", req.URL.String())
-			}
-		} else {
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-				shouldRetry = true
-				slog.Debug("retrying request",
-					"attempt", attempt,
-					"statusCode", resp.StatusCode,
-					"url", req.URL.String())
-			}
-		}
-
-		if !shouldRetry {
-			return resp, err
-		}
-
-		if attempt == opts.Retries {
-			return resp, err
-		}
-
-		if resp != nil {
-			if respErr := resp.Body.Close(); respErr != nil {
-				slog.Debug("failed to close response body during retry",
-					"attempt", attempt,
-					"error", respErr)
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
+func MakeGetRequest(ctx context.Context, url string, opts *models.Options) (*http.Response, error) {
+	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
 	}
-	return resp, err
+
+	getReq.Header.Set("User-Agent", opts.UserAgent)
+
+	getResp, err := DoRequestWithRetries(getReq, opts)
+	if err != nil {
+		return nil, err
+	}
+	return getResp, nil
 }
 
-func isNetworkError(err error) bool {
-	if err == nil {
-		return false
+func makeHEADorGETRequest(ctx context.Context, url string, opts *models.Options) (*http.Response, error) {
+	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	if err != nil {
+		return MakeGetRequest(ctx, url, opts)
 	}
 
-	if strings.Contains(err.Error(), "connection reset") ||
-		strings.Contains(err.Error(), "broken pipe") ||
-		strings.Contains(err.Error(), "connection refused") ||
-		strings.Contains(err.Error(), "no such host") ||
-		strings.Contains(err.Error(), "network is unreachable") {
-		return true
+	// Устанавливаем User-Agent (имитируем реальный браузер)
+	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
+
+	//headResp, err := opts.HTTPClient.Do(headReq)
+	headResp, err := DoRequestWithRetries(headReq, opts)
+	if err != nil {
+		return MakeGetRequest(ctx, url, opts)
 	}
-	return false
+
+	// При успешном HEAD запросе возвращаем response
+	if headResp.StatusCode >= 200 && headResp.StatusCode < 300 {
+		return headResp, nil
+	}
+	//Если статус-код не успешный, то закрывем тело head-запроса и делаем get-запрос
+	if err := headResp.Body.Close(); err != nil {
+		slog.Debug("failed to close HEAD response body", "error", err)
+	}
+	return MakeGetRequest(ctx, url, opts)
 }

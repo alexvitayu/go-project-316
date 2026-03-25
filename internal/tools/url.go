@@ -51,19 +51,6 @@ func ProcessLinks(links []string, opts *models.Options) ([]string, error) {
 	return URLs, nil
 }
 
-func isValidURL(rawURL string) bool {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return false
-	}
-
-	return supportedSchemes[parsed.Scheme]
-}
-
 func IsInnerLink(checkedURL string, item models.AliveInnerLink) bool {
 	// Парсим базовый URL
 	baseParsed, err := url.Parse(item.URL)
@@ -113,4 +100,17 @@ func ResolveUrl(baseURL, rawURL string) (string, error) {
 
 	abs := base.ResolveReference(u)
 	return abs.String(), nil
+}
+
+func isValidURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+
+	return supportedSchemes[parsed.Scheme]
 }

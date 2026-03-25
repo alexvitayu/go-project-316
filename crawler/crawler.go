@@ -2,11 +2,13 @@ package crawler
 
 import (
 	"bytes"
+	"code/internal/cache/assetscache"
 	"code/internal/fetcher"
 	"code/internal/limiter"
 	"code/internal/models"
 	"code/internal/parser"
 	"code/internal/tools"
+	"code/internal/tools/seen"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,7 +46,7 @@ func Analyze(c context.Context, opts models.Options) ([]byte, error) {
 	limiter := rate.NewLimiter(limiter.SetUpLimit(limiter.FindOutRPS(&opts)), opts.Concurrency)
 
 	// инициализируем структуру, которая собирает посещения и контроллирует конкурентный доступ к данным
-	visits := models.NewVisits()
+	visits := seen.NewVisits()
 
 	// инициализируем каналы для очереди адресов, ошибок, обработанных страниц и сигнальный канал done вместо wg
 	queueCh := make(chan models.AliveInnerLink, initQueueCapacity)
@@ -63,10 +65,9 @@ func Analyze(c context.Context, opts models.Options) ([]byte, error) {
 	}
 
 	// инициализируем AssetsCache, чтобы передать его каждому воркеру
-	cache := models.NewCacheAssets()
+	cache := assetscache.NewCacheAssets()
 
-	params := &models.FetchCrawlParams{
-		Ctx:         ctx,
+	params := &fetcher.FetchCrawlParams{
 		QueueCh:     queueCh,
 		Done:        done,
 		ErrsCh:      errsCh,
@@ -83,7 +84,7 @@ func Analyze(c context.Context, opts models.Options) ([]byte, error) {
 		localParams := *params
 
 		go func() {
-			crawlWorker(localParams)
+			crawlWorker(ctx, localParams)
 		}()
 	}
 
@@ -170,33 +171,7 @@ func Analyze(c context.Context, opts models.Options) ([]byte, error) {
 	return ReturnReport(&data, opts.IndentJSON, firstErr)
 }
 
-func ReturnReport(data *models.Report, indent bool, firstError error) ([]byte, error) {
-	var (
-		report []byte
-		err    error
-	)
-
-	if indent {
-		report, err = json.MarshalIndent(data, "", " ")
-	} else {
-		report, err = json.Marshal(data)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal report: %w", err)
-	}
-	report = append(report, '\n') // завершающий перевод строки
-
-	return report, firstError
-}
-
-func normalizePages(pages []models.Page) {
-	sort.Slice(pages, func(i, j int) bool {
-		return pages[i].URL < pages[j].URL
-	})
-}
-
-func crawlWorker(p models.FetchCrawlParams) {
+func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 	slog.Debug("goroutine started", "goroutine_id", p.Index, "status", "running")
 
 	defer func() {
@@ -204,23 +179,14 @@ func crawlWorker(p models.FetchCrawlParams) {
 		slog.Debug("goroutine finished", "goroutine_id", p.Index, "status", "finished")
 	}()
 
-	client := p.Options.HTTPClient
-	if client == nil {
-		httpClient := &http.Client{
-			Timeout: p.Options.Timeout,
-		}
-		client = httpClient
-	}
-	p.Client = client
-
 	for item := range p.QueueCh {
 		var page models.Page
 		p.Item = item
 
-		if p.Ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
+		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
 			slog.Debug("context done, stopping worker", "goroutine_id", p.Index)
-			page.Error = p.Ctx.Err().Error()
-			p.ErrsCh <- fmt.Errorf("context: %w", p.Ctx.Err())
+			page.Error = ctx.Err().Error()
+			p.ErrsCh <- fmt.Errorf("context: %w", ctx.Err())
 			atomic.AddInt32(p.PendingURLs, -1)
 			continue
 		}
@@ -245,14 +211,14 @@ func crawlWorker(p models.FetchCrawlParams) {
 
 		// теперь обрабатываем страницу
 		// Создаем новый запрос
-		if err := p.Limiter.Wait(p.Ctx); err != nil {
+		if err := p.Limiter.Wait(ctx); err != nil {
 			slog.Warn("rate limiter, method wait failed", "error", err)
 			p.ErrsCh <- fmt.Errorf("rate limiter: %w", err)
 			atomic.AddInt32(p.PendingURLs, -1)
 			return
 		}
 
-		req, err := http.NewRequestWithContext(p.Ctx, "GET", item.URL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("failed to make request: %w", err)
@@ -262,13 +228,13 @@ func crawlWorker(p models.FetchCrawlParams) {
 		// Устанавливаем User-Agent (имитируем реальный браузер)
 		req.Header.Set("User-Agent", p.Options.UserAgent) //обход блокировок на некоторых сайтах
 
-		brLinks := make([]models.BrokenLinks, 0)
+		brLinks := make([]models.BrokenLink, 0)
 		p.BrLinks = &brLinks
 
 		// Выполняем запрос
-		resp, err := fetcher.DoRequestWithRetries(req, &p.Options, client)
+		resp, err := fetcher.DoRequestWithRetries(req, &p.Options)
 		if err != nil {
-			brLinks = append(brLinks, models.BrokenLinks{
+			brLinks = append(brLinks, models.BrokenLink{
 				URL: item.URL,
 				Err: err.Error(),
 			})
@@ -282,7 +248,7 @@ func crawlWorker(p models.FetchCrawlParams) {
 		}
 
 		if resp.StatusCode >= http.StatusBadRequest {
-			brLinks = append(brLinks, models.BrokenLinks{
+			brLinks = append(brLinks, models.BrokenLink{
 				URL:        item.URL,
 				StatusCode: resp.StatusCode,
 				//Err:        resp.Status,
@@ -312,7 +278,7 @@ func crawlWorker(p models.FetchCrawlParams) {
 		}
 		p.URLs = URLs
 
-		err = fetcher.ArrangeLinks(p)
+		err = fetcher.ArrangeLinks(ctx, p)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("ArrangeLinks: %w", err)
@@ -327,16 +293,14 @@ func crawlWorker(p models.FetchCrawlParams) {
 			continue
 		}
 
-		assetPrms := models.FetchCollectParams{
-			Ctx:     p.Ctx,
+		assetPrms := parser.FetchCollectParams{
 			Opts:    p.Options,
 			BaseURL: item.URL,
 			Body:    bytes.NewReader(savedBody),
 			Cache:   p.Cache,
-			Client:  client,
 		}
 
-		assets, err := parser.CollectAssets(assetPrms)
+		assets, err := parser.CollectAssets(ctx, assetPrms)
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("CollectAssets: %w", err)
@@ -363,4 +327,30 @@ func crawlWorker(p models.FetchCrawlParams) {
 
 		atomic.AddInt32(p.PendingURLs, -1) // уменьшаем счётчик urls в ожидании обработки
 	}
+}
+
+func ReturnReport(data *models.Report, indent bool, firstError error) ([]byte, error) {
+	var (
+		report []byte
+		err    error
+	)
+
+	if indent {
+		report, err = json.MarshalIndent(data, "", " ")
+	} else {
+		report, err = json.Marshal(data)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal report: %w", err)
+	}
+	report = append(report, '\n') // завершающий перевод строки
+
+	return report, firstError
+}
+
+func normalizePages(pages []models.Page) {
+	sort.Slice(pages, func(i, j int) bool {
+		return pages[i].URL < pages[j].URL
+	})
 }
