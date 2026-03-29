@@ -1,23 +1,5 @@
 package models
 
-import (
-	"net/http"
-	"time"
-)
-
-type Options struct {
-	URL         string
-	Depth       int
-	Retries     int
-	Delay       time.Duration
-	Timeout     time.Duration
-	UserAgent   string
-	Concurrency int
-	IndentJSON  bool
-	HTTPClient  *http.Client
-	RPS         int
-}
-
 type Page struct {
 	URL          string       `json:"url"`
 	Depth        int          `json:"depth"`
@@ -34,13 +16,6 @@ type BrokenLink struct {
 	URL        string `json:"url"`
 	StatusCode int    `json:"status_code,omitempty"`
 	Err        string `json:"error,omitempty"`
-}
-
-type Report struct {
-	RootURL     string `json:"root_url"`
-	Depth       int    `json:"depth"`
-	GeneratedAt string `json:"generated_at"`
-	Pages       []Page `json:"pages"`
 }
 
 type AliveInnerLink struct {

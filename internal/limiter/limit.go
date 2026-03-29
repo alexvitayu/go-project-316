@@ -1,29 +1,28 @@
 package limiter
 
 import (
-	"code/internal/models"
 	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
 )
 
-func FindOutRPS(opts *models.Options) float64 {
+func FindOutRPS(RPS int, delay time.Duration) float64 {
 	var rps float64
 	switch {
-	case opts.RPS != 0 && opts.Delay != 0:
-		rps = float64(opts.RPS)
+	case RPS != 0 && delay != 0:
+		rps = float64(RPS)
 
-	case opts.RPS == 0 && opts.Delay != 0:
-		str := opts.Delay.String()
+	case RPS == 0 && delay != 0:
+		str := delay.String()
 		if strings.HasSuffix(str, "ms") {
-			rps = float64(1000*time.Millisecond) / float64(opts.Delay)
+			rps = float64(1000*time.Millisecond) / float64(delay)
 		} else if strings.HasSuffix(str, "s") {
-			rps = float64(time.Second) / float64(opts.Delay)
+			rps = float64(time.Second) / float64(delay)
 		}
 
-	case opts.Delay == 0 && opts.RPS != 0:
-		rps = float64(opts.RPS)
+	case delay == 0 && RPS != 0:
+		rps = float64(RPS)
 	default:
 		rps = 0
 	}

@@ -25,11 +25,11 @@ func NormalizeURL(rawURL string) string {
 	return parsed.String()
 }
 
-func ProcessLinks(links []string, opts *models.Options) ([]string, error) {
+func ProcessLinks(links []string, baseURL string) ([]string, error) {
 	repeated := make(map[string]struct{}) //отслеживаем одинаковые ссылки на странице
 	URLs := make([]string, 0, len(links))
 	for _, l := range links {
-		abs, err := ResolveUrl(opts.URL, l) // преобразуем URLs в абсолютные
+		abs, err := ResolveUrl(baseURL, l) // преобразуем URLs в абсолютные
 		if err != nil {
 			slog.Warn("failed to resolve URL", "link", l, "error", err)
 			continue

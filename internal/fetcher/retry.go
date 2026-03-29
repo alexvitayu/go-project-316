@@ -1,19 +1,18 @@
 package fetcher
 
 import (
-	"code/internal/models"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
 
-func DoRequestWithRetries(req *http.Request, opts *models.Options) (*http.Response, error) {
+func DoRequestWithRetries(req *http.Request, retries int, client *http.Client) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 
-	for attempt := 0; attempt <= opts.Retries; attempt++ {
-		resp, err = opts.HTTPClient.Do(req)
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, err = client.Do(req)
 
 		shouldRetry := false
 
@@ -39,19 +38,24 @@ func DoRequestWithRetries(req *http.Request, opts *models.Options) (*http.Respon
 			return resp, err
 		}
 
-		if attempt == opts.Retries {
+		if attempt == retries {
 			return resp, err
 		}
 
 		if resp != nil {
 			if respErr := resp.Body.Close(); respErr != nil {
-				slog.Debug("failed to close response body during retry",
+				slog.Debug("failed to close response body during retries",
 					"attempt", attempt,
 					"error", respErr)
 			}
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		// нарастающий attempt
+		delay := time.Duration(attempt+1) * 200 * time.Millisecond
+		if delay > 1*time.Second {
+			delay = 1 * time.Second
+		}
+		time.Sleep(delay)
 	}
 	return resp, err
 }

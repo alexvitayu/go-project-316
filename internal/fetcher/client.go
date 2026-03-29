@@ -2,6 +2,7 @@ package fetcher
 
 import (
 	"code/internal/cache/assetscache"
+	"code/internal/cache/linkscache"
 	"code/internal/models"
 	"code/internal/tools"
 	"code/internal/tools/seen"
@@ -10,43 +11,55 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync/atomic"
+	"sync"
 
 	"golang.org/x/time/rate"
 )
 
 type FetchCrawlParams struct {
+	BaseURL     string
 	QueueCh     chan models.AliveInnerLink
-	Done        chan<- struct{}
+	WorkerWG    *sync.WaitGroup
+	TasksWG     *sync.WaitGroup
 	ErrsCh      chan<- error
 	PagesCh     chan<- models.Page
 	Index       int
-	PendingURLs *int32
-	Options     models.Options
+	Retries     int
+	UserAgent   string
+	Depth       int
 	Visits      *seen.Visits
 	Limiter     *rate.Limiter
-	Cache       *assetscache.AssetsCache
+	AssetsCache *assetscache.AssetsCache
+	LinksCache  *linkscache.LinksCache
 	URLs        []string
 	Item        models.AliveInnerLink
 	BrLinks     *[]models.BrokenLink
-	Client      http.Client
+	Client      *http.Client
 }
 
 func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 	for _, u := range p.URLs {
 		if err := p.Limiter.Wait(ctx); err != nil {
 			slog.Error("rate limiter", "error", err)
-			atomic.AddInt32(p.PendingURLs, -1)
+			p.TasksWG.Done()
 			return fmt.Errorf("rate limiter: %w", err)
 		}
 
-		resp, err := makeHEADorGETRequest(ctx, u, &p.Options)
+		var resp *http.Response
+		var err error
+		var brokenLink models.BrokenLink
+
+		if p.LinksCache.IsThereInCache(u) {
+			resp, err = p.LinksCache.TakeFromCache(u)
+		} else {
+			resp, err = makeHEADorGETRequest(ctx, u, p.Retries, p.UserAgent, p.Client)
+			p.LinksCache.AddToCache(u, err, resp)
+		}
 		if err != nil {
-			brokenLink := models.BrokenLink{
+			brokenLink = models.BrokenLink{
 				URL: u,
 				Err: err.Error(),
 			}
-
 			if resp != nil {
 				brokenLink.StatusCode = resp.StatusCode
 			} else {
@@ -54,7 +67,6 @@ func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 					strings.Contains(err.Error(), "Not Found") {
 					brokenLink.StatusCode = 404
 				}
-
 				if strings.Contains(u, "/missing") {
 					brokenLink.StatusCode = 404
 				}
@@ -63,6 +75,7 @@ func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 			*p.BrLinks = append(*p.BrLinks, brokenLink)
 			continue
 		}
+
 		if err := resp.Body.Close(); err != nil {
 			slog.Debug("failed to close response body", "error", err)
 		}
@@ -77,15 +90,15 @@ func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			normalizedURL := tools.NormalizeURL(u)
-			if tools.IsInnerLink(normalizedURL, p.Item) && p.Item.LinkDepth < p.Options.Depth-1 {
-				atomic.AddInt32(p.PendingURLs, 1)
+			if tools.IsInnerLink(normalizedURL, p.Item) && p.Item.LinkDepth < p.Depth-1 {
+				p.TasksWG.Add(1)
 				select {
 				case p.QueueCh <- models.AliveInnerLink{
 					URL:       normalizedURL,
 					LinkDepth: p.Item.LinkDepth + 1,
 				}:
 				default:
-					atomic.AddInt32(p.PendingURLs, -1)
+					p.TasksWG.Done()
 					slog.Warn("queueCh is full")
 				}
 			}
@@ -96,34 +109,32 @@ func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 	return nil
 }
 
-func MakeGetRequest(ctx context.Context, url string, opts *models.Options) (*http.Response, error) {
+func MakeGetRequest(ctx context.Context, url string, userAgent string, retries int, c *http.Client) (*http.Response, error) {
 	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	getReq.Header.Set("User-Agent", opts.UserAgent)
+	getReq.Header.Set("User-Agent", userAgent)
 
-	getResp, err := DoRequestWithRetries(getReq, opts)
+	getResp, err := DoRequestWithRetries(getReq, retries, c)
 	if err != nil {
 		return nil, err
 	}
 	return getResp, nil
 }
 
-func makeHEADorGETRequest(ctx context.Context, url string, opts *models.Options) (*http.Response, error) {
+func makeHEADorGETRequest(ctx context.Context, url string, retries int, userAgent string, c *http.Client) (*http.Response, error) {
 	headReq, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
-		return MakeGetRequest(ctx, url, opts)
+		return MakeGetRequest(ctx, url, userAgent, retries, c)
 	}
 
 	// Устанавливаем User-Agent (имитируем реальный браузер)
-	headReq.Header.Set("User-Agent", opts.UserAgent) //обход блокировок на некоторых сайтах
-
-	//headResp, err := opts.HTTPClient.Do(headReq)
-	headResp, err := DoRequestWithRetries(headReq, opts)
+	headReq.Header.Set("User-Agent", userAgent) //обход блокировок на некоторых сайтах
+	headResp, err := DoRequestWithRetries(headReq, retries, c)
 	if err != nil {
-		return MakeGetRequest(ctx, url, opts)
+		return MakeGetRequest(ctx, url, userAgent, retries, c)
 	}
 
 	// При успешном HEAD запросе возвращаем response
@@ -134,5 +145,5 @@ func makeHEADorGETRequest(ctx context.Context, url string, opts *models.Options)
 	if err := headResp.Body.Close(); err != nil {
 		slog.Debug("failed to close HEAD response body", "error", err)
 	}
-	return MakeGetRequest(ctx, url, opts)
+	return MakeGetRequest(ctx, url, userAgent, retries, c)
 }

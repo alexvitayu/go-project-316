@@ -18,12 +18,13 @@ import (
 )
 
 type FetchCollectParams struct {
-	Opts    models.Options
-	BaseURL string
-	Body    io.Reader
-	Cache   *assetscache.AssetsCache
-	Client  http.Client
-	Doc     *goquery.Document
+	BaseURL   string
+	Body      io.Reader
+	Cache     *assetscache.AssetsCache
+	Client    http.Client
+	Doc       *goquery.Document
+	UserAgent string
+	Retries   int
 }
 
 func ParseHTML(r io.Reader) []string {
@@ -102,7 +103,7 @@ func FindAssets(ctx context.Context, p FetchCollectParams, asset string) []model
 				return
 			}
 
-			resp, err := fetcher.MakeGetRequest(ctx, u, &p.Opts)
+			resp, err := fetcher.MakeGetRequest(ctx, u, p.UserAgent, p.Retries, &p.Client)
 			if err != nil {
 				asset := models.Assets{
 					URL:   u,

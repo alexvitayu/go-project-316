@@ -3,7 +3,6 @@ package main
 import (
 	"code/config"
 	"code/crawler"
-	"code/internal/models"
 	"code/logger"
 	"context"
 	"log/slog"
@@ -92,7 +91,7 @@ func main() {
 				Timeout: timeout,
 			}
 
-			options := models.Options{
+			options := crawler.Options{
 				URL:         url,
 				Depth:       depth,
 				Retries:     retries,
