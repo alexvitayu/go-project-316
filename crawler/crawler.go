@@ -289,12 +289,12 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 			continue
 		}
 
-		if resp.StatusCode >= http.StatusBadRequest {
-			brLinks = append(brLinks, models.BrokenLink{
-				URL:        item.URL,
-				StatusCode: resp.StatusCode,
-			})
-		}
+		//if resp.StatusCode >= http.StatusBadRequest {
+		//	brLinks = append(brLinks, models.BrokenLink{
+		//		URL:        item.URL,
+		//		StatusCode: resp.StatusCode,
+		//	})
+		//}
 
 		// Сохраним body для дальнейшей работы в разных местах
 		savedBody, err := io.ReadAll(resp.Body)
