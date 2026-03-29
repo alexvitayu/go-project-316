@@ -226,6 +226,8 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 
 	for item := range p.QueueCh {
 		var page models.Page
+		brLinks := make([]models.BrokenLink, 0)
+		p.BrLinks = &brLinks
 		p.Item = item
 
 		if ctx.Err() != nil { // истёк таймаут или произошла отмена Ctrl + C
@@ -271,10 +273,6 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 
 		// Выполняем запрос
 		resp, err := fetcher.DoRequestWithRetries(req, p.Retries, p.Client)
-
-		brLinks := make([]models.BrokenLink, 0)
-		p.BrLinks = &brLinks
-
 		if err != nil {
 			brLinks = append(brLinks, models.BrokenLink{
 				URL: item.URL,
@@ -289,19 +287,19 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 			continue
 		}
 
-		//if resp.StatusCode >= http.StatusBadRequest {
-		//	brLinks = append(brLinks, models.BrokenLink{
-		//		URL:        item.URL,
-		//		StatusCode: resp.StatusCode,
-		//	})
-		//}
+		if resp.StatusCode >= http.StatusBadRequest {
+			brLinks = append(brLinks, models.BrokenLink{
+				URL:        item.URL,
+				StatusCode: resp.StatusCode,
+			})
+		}
 
 		// Сохраним body для дальнейшей работы в разных местах
 		savedBody, err := io.ReadAll(resp.Body)
 		if !p.LinksCache.IsThereInCache(item.URL) {
 			p.LinksCache.AddToCache(item.URL, err, resp)
 		}
-		if respErr := resp.Body.Close(); err != nil {
+		if respErr := resp.Body.Close(); respErr != nil {
 			slog.Debug("failed to close response body", "error", respErr)
 		}
 		if err != nil {
