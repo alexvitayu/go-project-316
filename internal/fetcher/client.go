@@ -8,6 +8,7 @@ import (
 	"code/internal/tools/seen"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -39,21 +40,42 @@ type FetchCrawlParams struct {
 
 func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 	for _, u := range p.URLs {
-		if err := p.Limiter.Wait(ctx); err != nil {
-			slog.Error("rate limiter", "error", err)
-			p.TasksWG.Done()
-			return fmt.Errorf("rate limiter: %w", err)
-		}
-
 		var resp *http.Response
 		var err error
+		var body []byte
 		var brokenLink models.BrokenLink
 
 		if p.LinksCache.IsThereInCache(u) {
-			resp, err = p.LinksCache.TakeFromCache(u)
+			resp, _, err = p.LinksCache.TakeFromCache(u)
+			if resp != nil && resp.Body != nil {
+				if respErr := resp.Body.Close(); respErr != nil {
+					slog.Debug("failed to close response body", "error", respErr)
+				}
+			}
+			slog.Debug("TAKEN from CACHE", "url", u)
 		} else {
+			if limErr := p.Limiter.Wait(ctx); limErr != nil {
+				slog.Error("rate limiter", "error", limErr)
+				p.ErrsCh <- fmt.Errorf("rate limiter: %w", limErr)
+				continue
+			}
 			resp, err = makeHEADorGETRequest(ctx, u, p.Retries, p.UserAgent, p.Client)
-			p.LinksCache.AddToCache(u, err, resp)
+			if resp != nil {
+				method := resp.Request.Method
+				if method == "GET" && resp.Body != nil {
+					body, err = io.ReadAll(resp.Body)
+					if respErr := resp.Body.Close(); respErr != nil {
+						slog.Debug("failed to close response body", "error", respErr)
+					}
+					p.LinksCache.AddToCache(u, err, resp.StatusCode, method, resp.Status, body)
+				} else if method == "HEAD" {
+					p.LinksCache.AddToCache(u, err, resp.StatusCode, method, resp.Status, nil)
+					if respErr := resp.Body.Close(); respErr != nil {
+						slog.Debug("failed to close response body", "error", respErr)
+					}
+				}
+				slog.Debug("MADE real REQUEST", "METHOD", method, "URL", u)
+			}
 		}
 		if err != nil {
 			brokenLink = models.BrokenLink{
@@ -76,8 +98,9 @@ func ArrangeLinks(ctx context.Context, p FetchCrawlParams) error {
 			continue
 		}
 
-		if err := resp.Body.Close(); err != nil {
-			slog.Debug("failed to close response body", "error", err)
+		if resp == nil {
+			slog.Error("response is nil", "url", u)
+			continue
 		}
 
 		switch {

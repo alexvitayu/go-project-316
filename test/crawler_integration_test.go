@@ -37,21 +37,33 @@ func (tr *TestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 			Status:     "ok",
 			StatusCode: 200,
 			Body:       io.NopCloser(bytes.NewReader(tr.data)),
+			Request: &http.Request{
+				Method: "GET",
+			},
 		}, nil
 	case "https://example.com/missing":
 		return &http.Response{
 			Status:     "Not Found",
 			StatusCode: 404,
+			Request: &http.Request{
+				Method: "GET",
+			},
 		}, nil
 	case "https://example.com/static/logo.png":
 		return &http.Response{
 			StatusCode:    200,
 			ContentLength: 12345,
 			Body:          io.NopCloser(strings.NewReader("len body = 12345")),
+			Request: &http.Request{
+				Method: "GET",
+			},
 		}, nil
 	default:
 		return &http.Response{
 			StatusCode: 0,
+			Request: &http.Request{
+				Method: "GET",
+			},
 		}, errors.New("Unknown URL")
 	}
 }

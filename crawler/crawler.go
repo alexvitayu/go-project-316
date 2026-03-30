@@ -254,37 +254,73 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 		p.Visits.Mu.Unlock()
 
 		// теперь обрабатываем страницу
-		// Создаем новый запрос
-		if err := p.Limiter.Wait(ctx); err != nil {
-			slog.Warn("rate limiter, method wait failed", "error", err)
-			p.ErrsCh <- fmt.Errorf("rate limiter: %w", err)
-			p.TasksWG.Done()
-			return
-		}
-		req, reqErr := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
-		if reqErr != nil {
-			page.Error = reqErr.Error()
-			p.ErrsCh <- fmt.Errorf("failed to make request: %w", reqErr)
-			continue
-		}
+		var resp *http.Response
+		var body []byte
+		var err error
 
-		// Устанавливаем User-Agent (имитируем реальный браузер)
-		req.Header.Set("User-Agent", p.UserAgent) //обход блокировок на некоторых сайтах
-
-		// Выполняем запрос
-		resp, err := fetcher.DoRequestWithRetries(req, p.Retries, p.Client)
-		if err != nil {
-			brLinks = append(brLinks, models.BrokenLink{
-				URL: item.URL,
-				Err: err.Error(),
-			})
-			if resp != nil {
-				if err = resp.Body.Close(); err != nil {
-					slog.Debug("failed to close response body", "error", err)
+		// проверяем или адрес есть в кэше и body не равно nil
+		if p.LinksCache.IsThereInCache(item.URL) && !p.LinksCache.IsBodyNil(item.URL) {
+			resp, body, err = p.LinksCache.TakeFromCache(item.URL)
+			if err != nil {
+				brLinks = append(brLinks, models.BrokenLink{
+					URL: item.URL,
+					Err: err.Error(),
+				})
+				if resp != nil {
+					if err = resp.Body.Close(); err != nil {
+						slog.Debug("failed to close response body", "error", err)
+					}
 				}
+				p.ErrsCh <- err
+				continue
 			}
-			p.ErrsCh <- err
-			continue
+		} else {
+			// если нет адреса в кэше или body равно nil, то делаем запрос
+			// Создаем новый запрос
+			if limErr := p.Limiter.Wait(ctx); limErr != nil {
+				slog.Warn("rate limiter, method wait failed", "error", limErr)
+				p.ErrsCh <- fmt.Errorf("rate limiter: %w", limErr)
+				p.TasksWG.Done()
+				return
+			}
+			req, reqErr := http.NewRequestWithContext(ctx, "GET", item.URL, nil)
+			if reqErr != nil {
+				page.Error = reqErr.Error()
+				p.ErrsCh <- fmt.Errorf("failed to make request: %w", reqErr)
+				continue
+			}
+
+			// Устанавливаем User-Agent (имитируем реальный браузер)
+			req.Header.Set("User-Agent", p.UserAgent) //обход блокировок на некоторых сайтах
+
+			// Выполняем запрос
+			resp, err = fetcher.DoRequestWithRetries(req, p.Retries, p.Client)
+			if err != nil {
+				brLinks = append(brLinks, models.BrokenLink{
+					URL: item.URL,
+					Err: err.Error(),
+				})
+				if resp != nil {
+					if err = resp.Body.Close(); err != nil {
+						slog.Debug("failed to close response body", "error", err)
+					}
+				}
+				p.ErrsCh <- err
+				continue
+			}
+			// сохраним body для работы в разных обработчиках
+			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				page.Error = err.Error()
+				p.ErrsCh <- fmt.Errorf("failed to save body: %w", err)
+				continue
+			}
+			// добавляем адрес и его данные в кэш
+			p.LinksCache.AddToCache(item.URL, err, resp.StatusCode, "GET", resp.Status, body)
+
+			if respErr := resp.Body.Close(); respErr != nil {
+				slog.Debug("failed to close response body", "error", respErr)
+			}
 		}
 
 		if resp.StatusCode >= http.StatusBadRequest {
@@ -294,22 +330,8 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 			})
 		}
 
-		// Сохраним body для дальнейшей работы в разных местах
-		savedBody, err := io.ReadAll(resp.Body)
-		if !p.LinksCache.IsThereInCache(item.URL) {
-			p.LinksCache.AddToCache(item.URL, err, resp)
-		}
-		if respErr := resp.Body.Close(); respErr != nil {
-			slog.Debug("failed to close response body", "error", respErr)
-		}
-		if err != nil {
-			page.Error = err.Error()
-			p.ErrsCh <- fmt.Errorf("failed to save body: %w", err)
-			continue
-		}
-
 		// Извлекаем ссылки из страницы
-		links := parser.ParseHTML(bytes.NewReader(savedBody))
+		links := parser.ParseHTML(bytes.NewReader(body))
 
 		// Преобразуем ссылки в абсолютные url и убираем дублирующиеся
 		URLs, err := tools.ProcessLinks(links, p.BaseURL)
@@ -328,7 +350,7 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 		}
 
 		// Соберём SEO из полученной html страницы
-		seo, err := parser.CollectSEO(bytes.NewReader(savedBody))
+		seo, err := parser.CollectSEO(bytes.NewReader(body))
 		if err != nil {
 			page.Error = err.Error()
 			p.ErrsCh <- fmt.Errorf("CollectSEO: %w", err)
@@ -337,7 +359,7 @@ func crawlWorker(ctx context.Context, p fetcher.FetchCrawlParams) {
 
 		assetPrms := parser.FetchCollectParams{
 			BaseURL:   item.URL,
-			Body:      bytes.NewReader(savedBody),
+			Body:      bytes.NewReader(body),
 			Cache:     p.AssetsCache,
 			Client:    *p.Client,
 			UserAgent: p.UserAgent,

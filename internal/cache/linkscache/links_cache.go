@@ -1,8 +1,6 @@
 package linkscache
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"sync"
 )
@@ -12,6 +10,7 @@ type cacheEntity struct {
 	statusCode int
 	status     string
 	err        error
+	method     string
 }
 
 type LinksCache struct {
@@ -26,22 +25,17 @@ func NewLinksCache() *LinksCache {
 	}
 }
 
-func (c *LinksCache) AddToCache(url string, err error, resp *http.Response) {
+func (c *LinksCache) AddToCache(url string, err error, statusCode int, method, status string, body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.cache[url]; !exists {
-		entity := &cacheEntity{
-			err: err,
+		c.cache[url] = &cacheEntity{
+			body:       body,
+			statusCode: statusCode,
+			status:     status,
+			err:        err,
+			method:     method,
 		}
-		if resp != nil {
-			body, readErr := io.ReadAll(resp.Body)
-			if readErr == nil {
-				entity.body = body
-				entity.statusCode = resp.StatusCode
-				entity.status = resp.Status
-			}
-		}
-		c.cache[url] = entity
 	}
 }
 
@@ -52,21 +46,40 @@ func (c *LinksCache) IsThereInCache(url string) bool {
 	return ok
 }
 
-func (c *LinksCache) TakeFromCache(url string) (*http.Response, error) {
+func (c *LinksCache) IsBodyNil(url string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if entity, exists := c.cache[url]; exists {
+		return entity.body == nil
+	}
+	return true
+}
+
+func (c *LinksCache) TakeFromCache(url string) (*http.Response, []byte, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	entity, exists := c.cache[url]
 	if !exists {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if entity.err != nil {
-		return nil, entity.err
+		return nil, nil, entity.err
 	}
 	resp := &http.Response{
 		StatusCode:    entity.statusCode,
 		Status:        entity.status,
-		Body:          io.NopCloser(bytes.NewReader(entity.body)),
 		ContentLength: int64(len(entity.body)),
 	}
-	return resp, nil
+	body := c.cache[url].body
+	return resp, body, nil
+}
+
+func (c *LinksCache) TakeMethodFromCache(url string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var method string
+	if entity, exists := c.cache[url]; exists {
+		method = entity.method
+	}
+	return method
 }
