@@ -27,6 +27,10 @@ run: build
 	fi
 	go run ./cmd/hexlet-go-crawler/main.go $(URL)
 
+# Устанавливает собранный бинарник в GOBIN, чтобы его можно было запускать из любого места.
+install: build
+	go install ./cmd/hexlet-go-crawler
+
 # Запуск тестов
 test:
 	@echo "${GREEN}Запуск тестов...${NC}"
